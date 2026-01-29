@@ -1,0 +1,84 @@
+stateDiagram-v2
+    [*] --> POWER_ON
+    POWER_ON --> INITIALIZATION: Power Applied
+    INITIALIZATION --> RUNNING: All Init OK
+    INITIALIZATION --> ERROR: Init Fails
+    RUNNING --> ERROR: Runtime Error
+    ERROR --> RUNNING: Recovery/Restart
+    
+    state RUNNING {
+        [*] --> MODULE_GIMBAL: moduleType=2 (Current)
+        MODULE_GIMBAL --> GIMBAL_IDLE
+        GIMBAL_IDLE --> GIMBAL_MOVING: T=133/134/141
+        GIMBAL_MOVING --> GIMBAL_STEADY: T=137,s=1
+        GIMBAL_MOVING --> GIMBAL_STOPPED: T=135
+        GIMBAL_STEADY --> GIMBAL_IDLE: T=137,s=0
+        GIMBAL_STOPPED --> GIMBAL_IDLE: Auto (3ms)
+        GIMBAL_MOVING --> GIMBAL_IDLE: Movement Complete
+    }
+    
+    state WiFi {
+        [*] --> WIFI_OFF: WIFI_CURRENT_MODE=0
+        WIFI_OFF --> WIFI_AP: T=402 (Set AP)
+        WIFI_OFF --> WIFI_STA: T=403 (Set STA)
+        WIFI_OFF --> WIFI_APSTA: T=404 (Set AP+STA)
+        WIFI_AP --> WIFI_STA: T=403
+        WIFI_AP --> WIFI_APSTA: T=404
+        WIFI_STA --> WIFI_AP: Timeout > 15s
+        WIFI_STA --> WIFI_APSTA: Connection Success (auto)
+        WIFI_STA --> WIFI_ERROR: Timeout > 15s
+        WIFI_APSTA --> WIFI_AP: STA Timeout > 15s
+        WIFI_APSTA --> WIFI_ERROR: STA Timeout > 15s
+        WIFI_ERROR --> WIFI_AP: Auto Fallback
+    }
+    
+    state ESPNOW {
+        [*] --> ESPNOW_FOLLOWER: espNowMode=3 (Default)
+        ESPNOW_FOLLOWER --> ESPNOW_NONE: T=410,mode=0
+        ESPNOW_FOLLOWER --> ESPNOW_LEADER_GROUP: T=410,mode=1
+        ESPNOW_FOLLOWER --> ESPNOW_LEADER_SINGLE: T=410,mode=2
+        ESPNOW_LEADER_GROUP --> ESPNOW_FOLLOWER: T=410,mode=3
+        ESPNOW_LEADER_SINGLE --> ESPNOW_FOLLOWER: T=410,mode=3
+        ESPNOW_NONE --> ESPNOW_FOLLOWER: T=410,mode=3
+    }
+    
+    state ServoComm {
+        [*] --> SERVO_CONNECTED: status=true
+        SERVO_CONNECTED --> SERVO_DISCONNECTED: st.FeedBack() == -1
+        SERVO_DISCONNECTED --> SERVO_CONNECTED: st.FeedBack() != -1
+    }
+    
+    state Feedback {
+        [*] --> FEEDBACK_ENABLED: baseFeedbackFlow=true (Default)
+        FEEDBACK_ENABLED --> FEEDBACK_DISABLED: T=131,cmd=0
+        FEEDBACK_DISABLED --> FEEDBACK_ENABLED: T=131,cmd=1
+    }
+    
+    state Heartbeat {
+        [*] --> HEARTBEAT_ACTIVE: heartbeatStopFlag=false
+        HEARTBEAT_ACTIVE --> HEARTBEAT_TIMEOUT: No cmd > 3s
+        HEARTBEAT_TIMEOUT --> HEARTBEAT_ACTIVE: Any command received
+    }
+    
+    state Mission {
+        [*] --> MISSION_IDLE: No mission running
+        MISSION_IDLE --> MISSION_PLAYING: missionPlay()
+        MISSION_PLAYING --> MISSION_IDLE: Steps complete
+        MISSION_PLAYING --> MISSION_ABORTED: Serial input
+        MISSION_ABORTED --> MISSION_IDLE: Function returns
+    }
+    
+    note right of RUNNING
+        Main loop executes continuously
+        All sub-states run concurrently
+    end note
+    
+    note right of WiFi
+        WIFI_MODE_ON_BOOT determines
+        initial state on boot
+    end note
+    
+    note right of GIMBAL_STEADY
+        IMU stabilization active
+        Compensates for pitch angle
+    end note

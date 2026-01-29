@@ -1,0 +1,29 @@
+PC-side tools for this project
+==============================
+
+This pan-tilt kit is based on the Waveshare **General Driver for Robots** (ESP32 + CP2102).
+
+Required (recommended):
+
+1) Google Chrome
+   - Used for the built-in Web UI at `http://192.168.4.1` (device hotspot mode).
+
+2) CP210x USB-to-UART driver (Windows)
+   - Only needed if no new COM port appears after connecting the ESP32 USB Type‑C.
+   - Waveshare driver zip:
+     https://files.waveshare.com/upload/d/d6/CP210x_USB_TO_UART.zip
+
+3) Python 3 + pip
+   - Used for `pc_control.py` (USB serial JSON control).
+   - Install deps:
+     python -m pip install -r requirements.txt
+
+Optional:
+
+4) Arduino IDE (ESP32 development)
+   - Only needed if you plan to reflash/customize the ESP32 firmware.
+   - https://www.arduino.cc/en/software
+
+Official references:
+ - https://www.waveshare.com/wiki/General_Driver_for_Robots
+ - https://www.waveshare.com/wiki/2-Axis_Pan-Tilt_Camera_Module
