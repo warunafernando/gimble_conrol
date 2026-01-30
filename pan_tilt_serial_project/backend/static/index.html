@@ -81,6 +81,33 @@
     input[type="range"] { width: 120px; vertical-align: middle; }
     .slider-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
     .slider-row label { min-width: 36px; }
+    .slider-vertical-wrap {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 160px;
+    }
+    #sliderTilt {
+      width: 160px;
+      height: 20px;
+      margin: 0;
+      transform: rotate(-90deg);
+      transform-origin: center center;
+    }
+    .move-content { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+    .move-sliders { flex: 0 0 auto; }
+    .move-buttons {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      min-height: 200px;
+    }
+    .move-buttons .btn-stop { margin-top: auto; }
+    .state-lock-row { display: flex; flex-direction: row; gap: 20px; align-items: flex-start; }
+    .state-lock-col { flex: 0 0 auto; }
+    .state-lock-col h2 { margin: 0 0 8px 0; }
+    .state-lock-col .btn-row { flex-direction: column; align-items: stretch; }
   </style>
 </head>
 <body>
@@ -118,56 +145,6 @@
       </div>
       <pre class="live" id="liveIna">—</pre>
     </div>
-  </div>
-
-  <div class="row" style="margin-top:12px">
-    <div class="panel">
-      <h2>State</h2>
-      <div class="btn-row">
-        <button id="cmdEnterTracking">Enter tracking (137)</button>
-        <button id="cmdEnterConfig">Enter config (139)</button>
-        <button id="cmdExitConfig">Exit config (140)</button>
-      </div>
-    </div>
-    <div class="panel">
-      <h2>Move</h2>
-      <div class="slider-row">
-        <label>Pan°</label>
-        <input type="range" id="sliderPan" min="-180" max="180" value="0" step="1" />
-        <input type="number" id="movePan" value="0" step="1" min="-180" max="180" style="width:56px" />
-      </div>
-      <div class="slider-row">
-        <label>Tilt°</label>
-        <input type="range" id="sliderTilt" min="-90" max="120" value="0" step="1" />
-        <input type="number" id="moveTilt" value="0" step="1" min="-90" max="120" style="width:56px" />
-      </div>
-      <div class="controls">
-        <label>Spd</label><input type="number" id="moveSpd" value="3400" />
-        <label>Acc</label><input type="number" id="moveAcc" value="100" />
-      </div>
-      <div class="btn-row">
-        <button id="cmdHome">Home (0°, 40°)</button>
-        <button id="cmdPanTiltAbs">Pan+Tilt Abs (133)</button>
-        <button id="cmdPanTiltMove">Pan+Tilt Move (134)</button>
-        <button id="cmdPanOnlyAbs">Pan only Abs (172)</button>
-        <button id="cmdTiltOnlyAbs">Tilt only Abs (173)</button>
-        <button id="cmdPanOnlyMove">Pan only Move (174)</button>
-        <button id="cmdTiltOnlyMove">Tilt only Move (175)</button>
-        <button id="cmdStop" class="danger">Stop (135)</button>
-      </div>
-    </div>
-    <div class="panel">
-      <h2>Lock</h2>
-      <div class="btn-row">
-        <button id="cmdPanLock">Pan lock (170)</button>
-        <button id="cmdPanUnlock">Pan unlock (170)</button>
-        <button id="cmdTiltLock">Tilt lock (171)</button>
-        <button id="cmdTiltUnlock">Tilt unlock (171)</button>
-      </div>
-    </div>
-  </div>
-
-  <div class="row" style="margin-top:12px">
     <div class="panel">
       <h2>Settings</h2>
       <div class="controls">
@@ -184,18 +161,61 @@
         <button id="cmdHeartbeat">Set (136)</button>
       </div>
     </div>
-    <div class="panel">
-      <h2>User ctrl (141)</h2>
-      <div class="controls">
-        <label>X</label><input type="number" id="userX" value="0" min="-1" max="2" />
-        <label>Y</label><input type="number" id="userY" value="0" min="-1" max="2" />
-        <label>Spd</label><input type="number" id="userSpd" value="300" />
-        <button id="cmdUserCtrl">Send</button>
-      </div>
-    </div>
   </div>
 
   <div class="row" style="margin-top:12px">
+    <div class="panel state-lock-row">
+      <div class="state-lock-col">
+        <h2>State</h2>
+        <div class="btn-row">
+          <button id="cmdEnterTracking">Enter tracking (137)</button>
+          <button id="cmdEnterConfig">Enter config (139)</button>
+          <button id="cmdExitConfig">Exit config (140)</button>
+        </div>
+      </div>
+      <div class="state-lock-col">
+        <h2>Lock</h2>
+        <div class="btn-row">
+          <button id="cmdPanLock">Pan lock (170)</button>
+          <button id="cmdPanUnlock">Pan unlock (170)</button>
+          <button id="cmdTiltLock">Tilt lock (171)</button>
+          <button id="cmdTiltUnlock">Tilt unlock (171)</button>
+        </div>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Move</h2>
+      <div class="move-content">
+        <div class="move-sliders">
+          <div class="slider-row">
+            <label>Pan°</label>
+            <input type="range" id="sliderPan" min="-180" max="180" value="0" step="1" />
+            <input type="number" id="movePan" value="0" step="1" min="-180" max="180" style="width:56px" />
+          </div>
+          <div class="slider-row">
+            <label>Tilt°</label>
+            <div class="slider-vertical-wrap">
+              <input type="range" id="sliderTilt" min="0" max="120" value="0" step="1" />
+            </div>
+            <input type="number" id="moveTilt" value="0" step="1" min="0" max="120" style="width:56px" />
+          </div>
+          <div class="controls">
+            <label>Spd</label><input type="number" id="moveSpd" value="3400" />
+            <label>Acc</label><input type="number" id="moveAcc" value="100" />
+          </div>
+        </div>
+        <div class="move-buttons">
+          <button id="cmdHome">Home (0°, 40°)</button>
+          <button id="cmdPanTiltAbs">Pan+Tilt Abs (133)</button>
+          <button id="cmdPanTiltMove">Pan+Tilt Move (134)</button>
+          <button id="cmdPanOnlyAbs">Pan only Abs (172)</button>
+          <button id="cmdTiltOnlyAbs">Tilt only Abs (173)</button>
+          <button id="cmdPanOnlyMove">Pan only Move (174)</button>
+          <button id="cmdTiltOnlyMove">Tilt only Move (175)</button>
+          <button id="cmdStop" class="danger btn-stop">Stop (135)</button>
+        </div>
+      </div>
+    </div>
     <div class="panel" id="configPanel">
       <h2>Config / diagnostics</h2>
       <div class="controls">
@@ -225,7 +245,22 @@
         <button id="cmdCalibrate" class="warn">Calibrate (502)</button>
       </div>
     </div>
-    <div class="panel" style="flex:1; min-width:320px">
+  </div>
+
+  <div class="row" style="margin-top:12px">
+    <div class="panel">
+      <h2>User ctrl (141)</h2>
+      <div class="controls">
+        <label>X</label><input type="number" id="userX" value="0" min="-1" max="2" />
+        <label>Y</label><input type="number" id="userY" value="0" min="-1" max="2" />
+        <label>Spd</label><input type="number" id="userSpd" value="300" />
+        <button id="cmdUserCtrl">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:12px">
+    <div class="panel" style="flex: 0 1 50%; min-width:200px; max-width:50%">
       <h2>Debug log</h2>
       <div class="debug" id="debugLog"></div>
       <button id="btnRefreshLog" style="margin-top:8px">Refresh log</button>
@@ -423,7 +458,7 @@
       movePanInput.value = v;
     });
     moveTiltInput.addEventListener('input', function () {
-      const v = Math.max(-90, Math.min(120, parseInt(moveTiltInput.value, 10) || 0));
+      const v = Math.max(0, Math.min(120, parseInt(moveTiltInput.value, 10) || 0));
       sliderTilt.value = v;
       moveTiltInput.value = v;
     });
