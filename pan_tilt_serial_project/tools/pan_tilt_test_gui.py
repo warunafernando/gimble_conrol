@@ -45,6 +45,12 @@ class PanTiltTestGUI:
         self._last_tilt_only_sent = None  # Last tilt value sent (avoid duplicate)
         self._pan_only_timer_id = None    # Throttle: send pan while dragging
         self._tilt_only_timer_id = None   # Throttle: send tilt while dragging
+        self._pan_confirm_job = None      # Delayed re-send to ensure pan move applied
+        self._tilt_confirm_job = None     # Delayed re-send to ensure tilt move applied
+        self._abs_confirm_job = None      # Delayed re-send for absolute (pan+tilt) move
+        self._PAN_TILT_RETRY_MS = 200     # Delay before retry on send failure
+        self._PAN_TILT_CONFIRM_MS = 450   # Delay before re-sending same command to ensure move
+        self._PAN_TILT_MAX_RETRIES = 2    # Max retries on send failure
         
         # Create GUI
         self.create_widgets()
@@ -872,10 +878,12 @@ class PanTiltTestGUI:
             return False
     
     # Command senders
-    def send_absolute(self):
+    def _send_absolute_confirm(self):
+        """Re-send current absolute (pan+tilt) command once to ensure move is applied."""
+        self._abs_confirm_job = None
         pan_val = round(self.pan_abs_var.get(), 1)
         tilt_val = round(self.tilt_abs_var.get(), 1)
-        self.log(f"Sending Absolute: Pan={pan_val}°, Tilt={tilt_val}° (T=133)", "DEBUG")
+        self.log(f"Re-sending Absolute: Pan={pan_val}°, Tilt={tilt_val}° (ensure move)", "DEBUG")
         self.send_command({
             "T": 133,
             "X": pan_val,
@@ -883,6 +891,25 @@ class PanTiltTestGUI:
             "SPD": 3400,
             "ACC": 100
         })
+
+    def send_absolute(self):
+        pan_val = round(self.pan_abs_var.get(), 1)
+        tilt_val = round(self.tilt_abs_var.get(), 1)
+        self.log(f"Sending Absolute: Pan={pan_val}°, Tilt={tilt_val}° (T=133)", "DEBUG")
+        if self._abs_confirm_job is not None:
+            self.root.after_cancel(self._abs_confirm_job)
+            self._abs_confirm_job = None
+        result = self.send_command({
+            "T": 133,
+            "X": pan_val,
+            "Y": tilt_val,
+            "SPD": 3400,
+            "ACC": 100
+        })
+        if result:
+            self._abs_confirm_job = self.root.after(
+                self._PAN_TILT_CONFIRM_MS, self._send_absolute_confirm
+            )
     
     def center_pan_tilt(self):
         self.pan_abs_var.set(0.0)
@@ -951,29 +978,123 @@ class PanTiltTestGUI:
         self._last_tilt_only_sent = 40.0
         self.send_tilt_only()
     
-    def send_pan_only(self):
+    def _cancel_pan_confirm(self):
+        if self._pan_confirm_job is not None:
+            self.root.after_cancel(self._pan_confirm_job)
+            self._pan_confirm_job = None
+
+    def _cancel_tilt_confirm(self):
+        if self._tilt_confirm_job is not None:
+            self.root.after_cancel(self._tilt_confirm_job)
+            self._tilt_confirm_job = None
+
+    def _send_pan_confirm(self):
+        """Re-send current pan command once to ensure move is applied."""
+        self._pan_confirm_job = None
         pan_val = round(self.pan_only_var.get(), 1)
-        self.log(f"Sending Pan Only: {pan_val}° (T=172)", "DEBUG")
+        self.log(f"Re-sending Pan Only: {pan_val}° (ensure move)", "DEBUG")
+        self.send_command({
+            "T": 172,
+            "X": pan_val,
+            "SPD": 3400,
+            "ACC": 100
+        })
+
+    def _send_tilt_confirm(self):
+        """Re-send current tilt command once to ensure move is applied."""
+        self._tilt_confirm_job = None
+        tilt_val = round(self.tilt_only_var.get(), 1)
+        self.log(f"Re-sending Tilt Only: {tilt_val}° (ensure move)", "DEBUG")
+        self.send_command({
+            "T": 173,
+            "Y": tilt_val,
+            "SPD": 3400,
+            "ACC": 100
+        })
+
+    def _retry_pan_once(self, attempt):
+        """Retry sending pan command after failure (attempt 1-based)."""
+        pan_val = round(self.pan_only_var.get(), 1)
+        self.log(f"Retry Pan Only ({attempt}/{self._PAN_TILT_MAX_RETRIES}): {pan_val}°", "DEBUG")
         result = self.send_command({
             "T": 172,
             "X": pan_val,
             "SPD": 3400,
             "ACC": 100
         })
-        if not result:
-            self.log("Failed to send Pan Only command", "ERROR")
-    
-    def send_tilt_only(self):
+        if result:
+            self._pan_confirm_job = self.root.after(
+                self._PAN_TILT_CONFIRM_MS, self._send_pan_confirm
+            )
+        elif attempt < self._PAN_TILT_MAX_RETRIES:
+            self._pan_confirm_job = self.root.after(
+                self._PAN_TILT_RETRY_MS,
+                lambda: self._retry_pan_once(attempt + 1)
+            )
+        else:
+            self.log("Pan Only command failed after retries", "ERROR")
+
+    def _retry_tilt_once(self, attempt):
+        """Retry sending tilt command after failure (attempt 1-based)."""
         tilt_val = round(self.tilt_only_var.get(), 1)
-        self.log(f"Sending Tilt Only: {tilt_val}° (T=173)", "DEBUG")
+        self.log(f"Retry Tilt Only ({attempt}/{self._PAN_TILT_MAX_RETRIES}): {tilt_val}°", "DEBUG")
         result = self.send_command({
             "T": 173,
             "Y": tilt_val,
             "SPD": 3400,
             "ACC": 100
         })
-        if not result:
-            self.log("Failed to send Tilt Only command", "ERROR")
+        if result:
+            self._tilt_confirm_job = self.root.after(
+                self._PAN_TILT_CONFIRM_MS, self._send_tilt_confirm
+            )
+        elif attempt < self._PAN_TILT_MAX_RETRIES:
+            self._tilt_confirm_job = self.root.after(
+                self._PAN_TILT_RETRY_MS,
+                lambda: self._retry_tilt_once(attempt + 1)
+            )
+        else:
+            self.log("Tilt Only command failed after retries", "ERROR")
+
+    def send_pan_only(self):
+        pan_val = round(self.pan_only_var.get(), 1)
+        self.log(f"Sending Pan Only: {pan_val}° (T=172)", "DEBUG")
+        self._cancel_pan_confirm()
+        result = self.send_command({
+            "T": 172,
+            "X": pan_val,
+            "SPD": 3400,
+            "ACC": 100
+        })
+        if result:
+            self._pan_confirm_job = self.root.after(
+                self._PAN_TILT_CONFIRM_MS, self._send_pan_confirm
+            )
+        else:
+            self.log("Pan Only send failed, will retry", "DEBUG")
+            self._pan_confirm_job = self.root.after(
+                self._PAN_TILT_RETRY_MS, lambda: self._retry_pan_once(1)
+            )
+
+    def send_tilt_only(self):
+        tilt_val = round(self.tilt_only_var.get(), 1)
+        self.log(f"Sending Tilt Only: {tilt_val}° (T=173)", "DEBUG")
+        self._cancel_tilt_confirm()
+        result = self.send_command({
+            "T": 173,
+            "Y": tilt_val,
+            "SPD": 3400,
+            "ACC": 100
+        })
+        if result:
+            self._tilt_confirm_job = self.root.after(
+                self._PAN_TILT_CONFIRM_MS, self._send_tilt_confirm
+            )
+        else:
+            self.log("Tilt Only send failed, will retry", "DEBUG")
+            self._tilt_confirm_job = self.root.after(
+                self._PAN_TILT_RETRY_MS, lambda: self._retry_tilt_once(1)
+            )
     
     def send_move(self):
         try:
