@@ -1,0 +1,283 @@
+# Binary gimbal protocol per GIMBAL_PROTOCOL.md
+# Frame: STX LEN SEQ TYPE PAYLOAD CHECKSUM ETX
+# CRC8 over LEN..PAYLOAD (poly 0x07, init 0x00)
+
+import struct
+from typing import Optional, Tuple
+
+STX = 0x02
+ETX = 0x03
+MAX_PAYLOAD = 251
+
+# Response types
+RSP_ACK_RECEIVED = 1
+RSP_ACK_EXECUTED = 2
+RSP_NACK = 3
+
+# Command types (host -> ESP32)
+CMD_GET_IMU = 126
+CMD_PAN_TILT_ABS = 133
+CMD_PAN_TILT_MOVE = 134
+CMD_PAN_TILT_STOP = 135
+CMD_USER_CTRL = 141
+CMD_PAN_LOCK = 170
+CMD_TILT_LOCK = 171
+CMD_PAN_ONLY_ABS = 172
+CMD_TILT_ONLY_ABS = 173
+CMD_PAN_ONLY_MOVE = 174
+CMD_TILT_ONLY_MOVE = 175
+CMD_GET_INA = 160
+CMD_FEEDBACK_FLOW = 131
+CMD_FEEDBACK_INTERVAL = 142
+CMD_HEARTBEAT_SET = 136
+CMD_PING_SERVO = 200
+CMD_SET_SERVO_ID = 501
+CMD_READ_BYTE = 210
+CMD_WRITE_BYTE = 211
+CMD_READ_WORD = 212
+CMD_WRITE_WORD = 213
+CMD_CALIBRATE = 502
+CMD_ENTER_TRACKING = 137
+CMD_ENTER_CONFIG = 139
+CMD_EXIT_CONFIG = 140
+
+
+def crc8(data: bytes) -> int:
+    crc = 0x00
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (0x07 ^ (crc << 1)) if (crc & 0x80) else (crc << 1)
+        crc &= 0xFF
+    return crc
+
+
+def build_frame(seq: int, type_id: int, payload: Optional[bytes] = None) -> bytes:
+    payload = payload or b""
+    if len(payload) > MAX_PAYLOAD:
+        raise ValueError("payload too long")
+    length = 4 + len(payload)
+    body = struct.pack("<BHH", length, seq & 0xFFFF, type_id & 0xFFFF) + payload
+    checksum = crc8(body)
+    return bytes([STX]) + body + bytes([checksum, ETX])
+
+
+def parse_frame(data: bytes) -> Optional[Tuple[int, int, bytes]]:
+    if len(data) < 8 or data[0] != STX:
+        return None
+    length = data[1]
+    if length < 4 or length > MAX_PAYLOAD:
+        return None
+    frame_size = 4 + length
+    if len(data) < frame_size:
+        return None
+    if data[frame_size - 1] != ETX:
+        return None
+    body = data[1 : frame_size - 2]
+    if crc8(body) != data[frame_size - 2]:
+        return None
+    seq = struct.unpack_from("<H", body, 1)[0]
+    type_id = struct.unpack_from("<H", body, 3)[0]
+    payload = body[5:5 + (length - 4)] if length > 4 else b""
+    return (seq, type_id, payload)
+
+
+def decode_move_feedback(payload: bytes) -> Optional[dict]:
+    if len(payload) < 8:
+        return None
+    pan_load = struct.unpack_from("<h", payload, 0)[0]
+    pan_pos = struct.unpack_from("<h", payload, 2)[0]
+    tilt_load = struct.unpack_from("<h", payload, 4)[0]
+    tilt_pos = struct.unpack_from("<h", payload, 6)[0]
+    return {"pan_load": pan_load, "pan_pos": pan_pos, "tilt_load": tilt_load, "tilt_pos": tilt_pos}
+
+
+def decode_ina(payload: bytes) -> Optional[dict]:
+    if len(payload) < 21:
+        return None
+    return {
+        "bus_v": struct.unpack_from("<f", payload, 0)[0],
+        "shunt_mv": struct.unpack_from("<f", payload, 4)[0],
+        "load_v": struct.unpack_from("<f", payload, 8)[0],
+        "current_ma": struct.unpack_from("<f", payload, 12)[0],
+        "power_mw": struct.unpack_from("<f", payload, 16)[0],
+        "overflow": payload[20] if len(payload) > 20 else 0,
+    }
+
+
+def decode_imu(payload: bytes) -> Optional[dict]:
+    if len(payload) < 50:
+        return None
+    return {
+        "roll": struct.unpack_from("<f", payload, 0)[0],
+        "pitch": struct.unpack_from("<f", payload, 4)[0],
+        "yaw": struct.unpack_from("<f", payload, 8)[0],
+        "ax": struct.unpack_from("<f", payload, 12)[0],
+        "ay": struct.unpack_from("<f", payload, 16)[0],
+        "az": struct.unpack_from("<f", payload, 20)[0],
+        "gx": struct.unpack_from("<f", payload, 24)[0],
+        "gy": struct.unpack_from("<f", payload, 28)[0],
+        "gz": struct.unpack_from("<f", payload, 32)[0],
+        "mx": struct.unpack_from("<h", payload, 36)[0],
+        "my": struct.unpack_from("<h", payload, 38)[0],
+        "mz": struct.unpack_from("<h", payload, 40)[0],
+        "temp": struct.unpack_from("<f", payload, 46)[0],
+    }
+
+
+# Human-readable log helpers
+CMD_NAMES = {
+    CMD_GET_IMU: "GET_IMU",
+    CMD_PAN_TILT_ABS: "PAN_TILT_ABS",
+    CMD_PAN_TILT_MOVE: "PAN_TILT_MOVE",
+    CMD_PAN_TILT_STOP: "PAN_TILT_STOP",
+    CMD_USER_CTRL: "USER_CTRL",
+    CMD_PAN_LOCK: "PAN_LOCK",
+    CMD_TILT_LOCK: "TILT_LOCK",
+    CMD_PAN_ONLY_ABS: "PAN_ONLY_ABS",
+    CMD_TILT_ONLY_ABS: "TILT_ONLY_ABS",
+    CMD_PAN_ONLY_MOVE: "PAN_ONLY_MOVE",
+    CMD_TILT_ONLY_MOVE: "TILT_ONLY_MOVE",
+    CMD_GET_INA: "GET_INA",
+    CMD_FEEDBACK_FLOW: "FEEDBACK_FLOW",
+    CMD_FEEDBACK_INTERVAL: "FEEDBACK_INTERVAL",
+    CMD_HEARTBEAT_SET: "HEARTBEAT_SET",
+    CMD_PING_SERVO: "PING_SERVO",
+    CMD_SET_SERVO_ID: "SET_SERVO_ID",
+    CMD_READ_BYTE: "READ_BYTE",
+    CMD_WRITE_BYTE: "WRITE_BYTE",
+    CMD_READ_WORD: "READ_WORD",
+    CMD_WRITE_WORD: "WRITE_WORD",
+    CMD_CALIBRATE: "CALIBRATE",
+    CMD_ENTER_TRACKING: "ENTER_TRACKING",
+    CMD_ENTER_CONFIG: "ENTER_CONFIG",
+    CMD_EXIT_CONFIG: "EXIT_CONFIG",
+}
+RSP_NAMES = {
+    RSP_ACK_RECEIVED: "ACK_RECEIVED",
+    RSP_ACK_EXECUTED: "ACK_EXECUTED",
+    RSP_NACK: "NACK",
+    1002: "IMU",
+    1010: "INA",
+    1011: "SERVO",
+    1012: "HEARTBEAT_STATUS",
+    2001: "PING_RESP",
+    5002: "SET_ID_OK",
+    5003: "SET_ID_VERIFY",
+    5001: "SET_ID_ERR",
+    2101: "READ_BYTE_RESP",
+    2111: "WRITE_BYTE_RESP",
+    2121: "READ_WORD_RESP",
+    2131: "WRITE_WORD_RESP",
+    5021: "CALIBRATE_RESP",
+}
+
+
+def format_tx_for_log(seq: int, type_id: int, payload: bytes) -> str:
+    """Human-readable TX line for debug log."""
+    name = CMD_NAMES.get(type_id, f"CMD_{type_id}")
+    try:
+        if type_id == CMD_PAN_TILT_ABS and len(payload) >= 12:
+            pan, tilt = struct.unpack_from("<ff", payload, 0)
+            spd, acc = struct.unpack_from("<HH", payload, 8)
+            return f"TX {name} seq={seq} pan={pan:.1f} tilt={tilt:.1f} spd={spd} acc={acc}"
+        if type_id == CMD_PAN_TILT_MOVE and len(payload) >= 12:
+            pan, tilt = struct.unpack_from("<ff", payload, 0)
+            sx, sy = struct.unpack_from("<HH", payload, 8)
+            return f"TX {name} seq={seq} pan={pan:.1f} tilt={tilt:.1f} sx={sx} sy={sy}"
+        if type_id == CMD_PAN_TILT_STOP:
+            return f"TX {name} seq={seq}"
+        if type_id == CMD_USER_CTRL and len(payload) >= 4:
+            x, y = struct.unpack_from("<bb", payload, 0)[0], struct.unpack_from("<bb", payload, 1)[0]
+            spd = struct.unpack_from("<H", payload, 2)[0]
+            return f"TX {name} seq={seq} x={x} y={y} spd={spd}"
+        if type_id in (CMD_PAN_LOCK, CMD_TILT_LOCK) and len(payload) >= 1:
+            cmd = "lock" if payload[0] else "unlock"
+            return f"TX {name} seq={seq} {cmd}"
+        if type_id == CMD_PAN_ONLY_ABS and len(payload) >= 8:
+            pan = struct.unpack_from("<f", payload, 0)[0]
+            spd, acc = struct.unpack_from("<HH", payload, 4)[0], struct.unpack_from("<HH", payload, 6)[1]
+            return f"TX {name} seq={seq} pan={pan:.1f} spd={spd} acc={acc}"
+        if type_id == CMD_TILT_ONLY_ABS and len(payload) >= 8:
+            tilt = struct.unpack_from("<f", payload, 0)[0]
+            spd, acc = struct.unpack_from("<HH", payload, 4)[0], struct.unpack_from("<HH", payload, 6)[1]
+            return f"TX {name} seq={seq} tilt={tilt:.1f} spd={spd} acc={acc}"
+        if type_id == CMD_PAN_ONLY_MOVE and len(payload) >= 6:
+            pan = struct.unpack_from("<f", payload, 0)[0]
+            sx = struct.unpack_from("<H", payload, 4)[0]
+            return f"TX {name} seq={seq} pan={pan:.1f} sx={sx}"
+        if type_id == CMD_TILT_ONLY_MOVE and len(payload) >= 6:
+            tilt = struct.unpack_from("<f", payload, 0)[0]
+            sy = struct.unpack_from("<H", payload, 4)[0]
+            return f"TX {name} seq={seq} tilt={tilt:.1f} sy={sy}"
+        if type_id == CMD_GET_IMU or type_id == CMD_GET_INA:
+            return f"TX {name} seq={seq}"
+        if type_id == CMD_FEEDBACK_FLOW and len(payload) >= 1:
+            return f"TX {name} seq={seq} on={payload[0]}"
+        if type_id == CMD_FEEDBACK_INTERVAL and len(payload) >= 2:
+            ms = struct.unpack_from("<H", payload, 0)[0]
+            return f"TX {name} seq={seq} interval_ms={ms}"
+        if type_id == CMD_HEARTBEAT_SET and len(payload) >= 2:
+            ms = struct.unpack_from("<H", payload, 0)[0]
+            return f"TX {name} seq={seq} timeout_ms={ms}"
+        if type_id == CMD_PING_SERVO and len(payload) >= 1:
+            return f"TX {name} seq={seq} id={payload[0]}"
+        if type_id == CMD_SET_SERVO_ID and len(payload) >= 2:
+            return f"TX {name} seq={seq} from={payload[0]} to={payload[1]}"
+        if type_id == CMD_READ_BYTE and len(payload) >= 2:
+            return f"TX {name} seq={seq} id={payload[0]} addr={payload[1]}"
+        if type_id == CMD_READ_WORD and len(payload) >= 2:
+            return f"TX {name} seq={seq} id={payload[0]} addr={payload[1]}"
+        if type_id == CMD_WRITE_BYTE and len(payload) >= 3:
+            return f"TX {name} seq={seq} id={payload[0]} addr={payload[1]} val={payload[2]}"
+        if type_id == CMD_WRITE_WORD and len(payload) >= 4:
+            val = struct.unpack_from("<H", payload, 2)[0]
+            return f"TX {name} seq={seq} id={payload[0]} addr={payload[1]} val={val}"
+        if type_id == CMD_CALIBRATE and len(payload) >= 1:
+            return f"TX {name} seq={seq} id={payload[0]}"
+        if type_id in (CMD_ENTER_TRACKING, CMD_ENTER_CONFIG, CMD_EXIT_CONFIG):
+            return f"TX {name} seq={seq}"
+    except (struct.error, IndexError):
+        pass
+    return f"TX {name} seq={seq} len={len(payload)}"
+
+
+def format_rx_for_log(seq: int, type_id: int, payload: bytes) -> str:
+    """Human-readable RX line for debug log."""
+    name = RSP_NAMES.get(type_id, f"RSP_{type_id}")
+    try:
+        if type_id == RSP_ACK_RECEIVED:
+            return f"RX {name} seq={seq}"
+        if type_id == RSP_ACK_EXECUTED and len(payload) >= 8:
+            fb = decode_move_feedback(payload)
+            if fb:
+                return f"RX {name} seq={seq} pan_pos={fb['pan_pos']} pan_load={fb['pan_load']} tilt_pos={fb['tilt_pos']} tilt_load={fb['tilt_load']}"
+        if type_id == RSP_NACK and len(payload) >= 1:
+            code = payload[0]
+            codes = {1: "checksum", 2: "unknown_type", 3: "state_rejected", 4: "exec_failed"}
+            return f"RX {name} seq={seq} code={code} ({codes.get(code, '?')})"
+        if type_id == 1002 and len(payload) >= 50:
+            imu = decode_imu(payload)
+            if imu:
+                return f"RX IMU seq={seq} roll={imu['roll']:.2f} pitch={imu['pitch']:.2f} yaw={imu['yaw']:.2f}"
+        if type_id == 1010 and len(payload) >= 21:
+            ina = decode_ina(payload)
+            if ina:
+                return f"RX INA seq={seq} bus_v={ina['bus_v']:.3f}V current_ma={ina['current_ma']:.2f} power_mw={ina['power_mw']:.1f}"
+    except (struct.error, IndexError, KeyError):
+        pass
+    return f"RX {name} seq={seq} len={len(payload)}"
+
+
+# Build command helpers
+def cmd_pan_tilt_abs(seq: int, pan: float, tilt: float, spd: int = 3400, acc: int = 100) -> bytes:
+    payload = struct.pack("<ffHH", pan, tilt, spd, acc)
+    return build_frame(seq, CMD_PAN_TILT_ABS, payload)
+
+
+def cmd_enter_tracking(seq: int) -> bytes:
+    return build_frame(seq, CMD_ENTER_TRACKING, b"")
+
+
+def cmd_get_imu(seq: int) -> bytes:
+    return build_frame(seq, CMD_GET_IMU, b"")

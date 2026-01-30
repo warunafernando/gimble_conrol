@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gimbal Web GUI</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.4/socket.io.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f0f12;
+      --panel: #1a1a1f;
+      --border: #2a2a32;
+      --text: #e0e0e0;
+      --accent: #4a9eff;
+      --ok: #2ecc71;
+      --err: #e74c3c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 16px;
+      min-height: 100vh;
+    }
+    h1 { font-size: 1.25rem; margin: 0 0 12px 0; color: var(--accent); }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 16px;
+      min-width: 180px;
+    }
+    .panel h2 { font-size: 0.85rem; margin: 0 0 8px 0; color: #888; text-transform: uppercase; }
+    .status { display: flex; align-items: center; gap: 8px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--err); }
+    .dot.connected { background: var(--ok); }
+    .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+    input[type="text"], input[type="number"] {
+      background: #25252d;
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 6px 8px;
+      border-radius: 6px;
+      width: 70px;
+      font-size: 0.85rem;
+    }
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      padding: 6px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.85rem;
+    }
+    button:hover { filter: brightness(1.1); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.danger { background: var(--err); }
+    button.warn { background: #d4a017; }
+    .live { font-family: 'Consolas', monospace; font-size: 0.85rem; }
+    .live .k { color: #888; }
+    .live .v { color: #a8e6cf; }
+    .debug {
+      flex: 1;
+      min-width: 320px;
+      max-height: 280px;
+      overflow-y: auto;
+      font-family: 'Consolas', monospace;
+      font-size: 0.75rem;
+      line-height: 1.4;
+      background: #0d0d10;
+      padding: 10px;
+      border-radius: 6px;
+    }
+    .debug .line { margin: 2px 0; color: #8a8a9a; }
+    label { font-size: 0.8rem; color: #aaa; margin-right: 4px; }
+    .btn-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    input[type="range"] { width: 120px; vertical-align: middle; }
+    .slider-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+    .slider-row label { min-width: 36px; }
+  </style>
+</head>
+<body>
+  <h1>Gimbal Web GUI</h1>
+
+  <div class="row">
+    <div class="panel">
+      <h2>Connection</h2>
+      <div class="status">
+        <span class="dot" id="dot"></span>
+        <span id="connStatus">Disconnected</span>
+      </div>
+      <div class="controls" style="margin-top:10px">
+        <input type="text" id="port" value="COM9" placeholder="Port" />
+        <input type="text" id="baud" value="921600" placeholder="Baud" />
+        <button id="btnConnect">Connect</button>
+        <button id="btnDisconnect" class="danger" disabled>Disconnect</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Live (move feedback)</h2>
+      <pre class="live" id="liveMove">—</pre>
+    </div>
+    <div class="panel">
+      <h2>IMU (last)</h2>
+      <div class="btn-row" style="margin-bottom:6px">
+        <button id="cmdGetImu">Get IMU (126)</button>
+      </div>
+      <pre class="live" id="liveImu">—</pre>
+    </div>
+    <div class="panel">
+      <h2>INA (last)</h2>
+      <div class="btn-row" style="margin-bottom:6px">
+        <button id="cmdGetIna">Get INA (160)</button>
+      </div>
+      <pre class="live" id="liveIna">—</pre>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:12px">
+    <div class="panel">
+      <h2>State</h2>
+      <div class="btn-row">
+        <button id="cmdEnterTracking">Enter tracking (137)</button>
+        <button id="cmdEnterConfig">Enter config (139)</button>
+        <button id="cmdExitConfig">Exit config (140)</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Move</h2>
+      <div class="slider-row">
+        <label>Pan°</label>
+        <input type="range" id="sliderPan" min="-180" max="180" value="0" step="1" />
+        <input type="number" id="movePan" value="0" step="1" min="-180" max="180" style="width:56px" />
+      </div>
+      <div class="slider-row">
+        <label>Tilt°</label>
+        <input type="range" id="sliderTilt" min="-90" max="120" value="0" step="1" />
+        <input type="number" id="moveTilt" value="0" step="1" min="-90" max="120" style="width:56px" />
+      </div>
+      <div class="controls">
+        <label>Spd</label><input type="number" id="moveSpd" value="3400" />
+        <label>Acc</label><input type="number" id="moveAcc" value="100" />
+      </div>
+      <div class="btn-row">
+        <button id="cmdHome">Home (0°, 40°)</button>
+        <button id="cmdPanTiltAbs">Pan+Tilt Abs (133)</button>
+        <button id="cmdPanTiltMove">Pan+Tilt Move (134)</button>
+        <button id="cmdPanOnlyAbs">Pan only Abs (172)</button>
+        <button id="cmdTiltOnlyAbs">Tilt only Abs (173)</button>
+        <button id="cmdPanOnlyMove">Pan only Move (174)</button>
+        <button id="cmdTiltOnlyMove">Tilt only Move (175)</button>
+        <button id="cmdStop" class="danger">Stop (135)</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Lock</h2>
+      <div class="btn-row">
+        <button id="cmdPanLock">Pan lock (170)</button>
+        <button id="cmdPanUnlock">Pan unlock (170)</button>
+        <button id="cmdTiltLock">Tilt lock (171)</button>
+        <button id="cmdTiltUnlock">Tilt unlock (171)</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:12px">
+    <div class="panel">
+      <h2>Settings</h2>
+      <div class="controls">
+        <label>Feedback</label>
+        <button id="cmdFbOn">On (131)</button>
+        <button id="cmdFbOff">Off (131)</button>
+      </div>
+      <div class="controls" style="margin-top:6px">
+        <label>Interval ms</label><input type="number" id="fbInterval" value="100" />
+        <button id="cmdFbInterval">Set (142)</button>
+      </div>
+      <div class="controls" style="margin-top:6px">
+        <label>Heartbeat ms</label><input type="number" id="heartbeatMs" value="0" />
+        <button id="cmdHeartbeat">Set (136)</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>User ctrl (141)</h2>
+      <div class="controls">
+        <label>X</label><input type="number" id="userX" value="0" min="-1" max="2" />
+        <label>Y</label><input type="number" id="userY" value="0" min="-1" max="2" />
+        <label>Spd</label><input type="number" id="userSpd" value="300" />
+        <button id="cmdUserCtrl">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:12px">
+    <div class="panel" id="configPanel">
+      <h2>Config / diagnostics</h2>
+      <div class="controls">
+        <label>PING id</label><input type="number" id="pingId" value="1" min="1" max="254" />
+        <button id="cmdPing">PING (200)</button>
+      </div>
+      <div class="controls" style="margin-top:6px">
+        <label>Read id</label><input type="number" id="readId" value="1" />
+        <label>addr</label><input type="number" id="readAddr" value="0" />
+        <button id="cmdReadByte">Read byte (210)</button>
+        <button id="cmdReadWord">Read word (212)</button>
+      </div>
+      <div class="controls" style="margin-top:6px">
+        <label>Write id</label><input type="number" id="writeId" value="1" />
+        <label>addr</label><input type="number" id="writeAddr" value="0" />
+        <label>val</label><input type="number" id="writeVal" value="0" />
+        <button id="cmdWriteByte">Write byte (211)</button>
+        <button id="cmdWriteWord">Write word (213)</button>
+      </div>
+      <div class="controls" style="margin-top:6px">
+        <label>Set ID from</label><input type="number" id="setIdFrom" value="1" />
+        <label>to</label><input type="number" id="setIdTo" value="2" />
+        <button id="cmdSetId" class="warn">Set servo ID (501)</button>
+      </div>
+      <div class="controls" style="margin-top:6px">
+        <label>Calibrate id</label><input type="number" id="calId" value="1" />
+        <button id="cmdCalibrate" class="warn">Calibrate (502)</button>
+      </div>
+    </div>
+    <div class="panel" style="flex:1; min-width:320px">
+      <h2>Debug log</h2>
+      <div class="debug" id="debugLog"></div>
+      <button id="btnRefreshLog" style="margin-top:8px">Refresh log</button>
+    </div>
+  </div>
+
+  <script>
+    const socket = io();
+    const dot = document.getElementById('dot');
+    const connStatus = document.getElementById('connStatus');
+    const portInput = document.getElementById('port');
+    const baudInput = document.getElementById('baud');
+    const btnConnect = document.getElementById('btnConnect');
+    const btnDisconnect = document.getElementById('btnDisconnect');
+    const liveMove = document.getElementById('liveMove');
+    const liveImu = document.getElementById('liveImu');
+    const liveIna = document.getElementById('liveIna');
+    const debugLog = document.getElementById('debugLog');
+    const configPanel = document.getElementById('configPanel');
+    let gimbalState = 'idle';
+
+    function floatToBytes(f) {
+      const buf = new ArrayBuffer(4);
+      new DataView(buf).setFloat32(0, f, true);
+      return Array.from(new Uint8Array(buf));
+    }
+    function u16ToBytes(n) {
+      n = n >>> 0;
+      return [n & 0xff, (n >> 8) & 0xff];
+    }
+    function i8ToByte(x) {
+      return ((x << 24) >> 24) & 0xff;
+    }
+    function sendCommand(typeId, payload) {
+      const pl = payload == null ? [] : (Array.isArray(payload) ? payload : Array.from(payload));
+      socket.emit('command', { type: typeId, payload: pl });
+    }
+
+    function setConnected(connected) {
+      dot.classList.toggle('connected', connected);
+      connStatus.textContent = connected ? 'Connected' : 'Disconnected';
+      btnConnect.disabled = connected;
+      btnDisconnect.disabled = !connected;
+    }
+
+    socket.on('state', function (s) {
+      setConnected(s.connected);
+      if (s.port) portInput.value = s.port;
+    });
+    socket.on('frame', function (data) {
+      if (data.payload) {
+        if (data.type === 2 && data.payload.pan_pos !== undefined) {
+          const p = data.payload;
+          liveMove.textContent = `pan_pos ${p.pan_pos}  pan_load ${p.pan_load}\ntilt_pos ${p.tilt_pos}  tilt_load ${p.tilt_load}`;
+        } else if (data.type === 1002) {
+          const i = data.payload;
+          liveImu.textContent = `r ${(i.roll||0).toFixed(2)}  p ${(i.pitch||0).toFixed(2)}  y ${(i.yaw||0).toFixed(2)}`;
+        } else if (data.type === 1010) {
+          const a = data.payload || {};
+          if (a.error) {
+            liveIna.textContent = `INA error: ${a.error} (len=${a.len}${a.expected != null ? ', expected ' + a.expected : ''})`;
+          } else {
+            liveIna.textContent = `bus_v ${(a.bus_v != null ? a.bus_v : 0).toFixed(3)} V  load_v ${(a.load_v != null ? a.load_v : 0).toFixed(3)} V\ncurrent_ma ${(a.current_ma != null ? a.current_ma : 0).toFixed(2)} mA  power_mw ${(a.power_mw != null ? a.power_mw : 0).toFixed(1)} mW\nshunt_mv ${(a.shunt_mv != null ? a.shunt_mv : 0).toFixed(2)} mV  overflow ${a.overflow != null ? a.overflow : 0}`;
+          }
+        }
+      }
+    });
+    socket.on('log_line', function (data) {
+      const div = document.createElement('div');
+      div.className = 'line';
+      div.textContent = data.line;
+      debugLog.appendChild(div);
+      debugLog.scrollTop = debugLog.scrollHeight;
+    });
+    socket.on('log_history', function (data) {
+      debugLog.innerHTML = (data.lines || []).map(l => `<div class="line">${escapeHtml(l)}</div>`).join('');
+      debugLog.scrollTop = debugLog.scrollHeight;
+    });
+    socket.on('connect_serial_result', function (data) {
+      setConnected(data.ok);
+      if (!data.ok) alert('Failed to connect to ' + data.port);
+    });
+    socket.on('error', function (data) { alert(data.msg || 'Error'); });
+
+    function escapeHtml(s) {
+      const d = document.createElement('div');
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    btnConnect.onclick = function () {
+      socket.emit('connect_serial', { port: portInput.value.trim(), baud: parseInt(baudInput.value, 10) || 921600 });
+    };
+    btnDisconnect.onclick = function () { socket.emit('disconnect_serial'); };
+    btnRefreshLog.onclick = function () { socket.emit('get_log'); };
+
+    function setConfigVisible(visible) {
+      configPanel.style.display = visible ? 'block' : 'none';
+    }
+
+    // State
+    document.getElementById('cmdEnterTracking').onclick = function () {
+      sendCommand(137, []);
+      gimbalState = 'tracking';
+      setConfigVisible(false);
+    };
+    document.getElementById('cmdEnterConfig').onclick = function () {
+      sendCommand(139, []);
+      gimbalState = 'config';
+      setConfigVisible(true);
+    };
+    document.getElementById('cmdExitConfig').onclick = function () {
+      sendCommand(140, []);
+      gimbalState = 'idle';
+      setConfigVisible(true);
+    };
+
+    // Move
+    function getMove() {
+      const pan = parseFloat(document.getElementById('movePan').value) || 0;
+      const tilt = parseFloat(document.getElementById('moveTilt').value) || 0;
+      const spd = parseInt(document.getElementById('moveSpd').value, 10) || 3400;
+      const acc = parseInt(document.getElementById('moveAcc').value, 10) || 100;
+      return { pan, tilt, spd, acc };
+    }
+    document.getElementById('cmdHome').onclick = function () {
+      const m = getMove();
+      sendCommand(133, floatToBytes(0).concat(floatToBytes(40), u16ToBytes(m.spd), u16ToBytes(m.acc)));
+      document.getElementById('sliderPan').value = 0;
+      document.getElementById('movePan').value = 0;
+      document.getElementById('sliderTilt').value = 40;
+      document.getElementById('moveTilt').value = 40;
+    };
+    document.getElementById('cmdPanTiltAbs').onclick = function () {
+      const m = getMove();
+      sendCommand(133, floatToBytes(m.pan).concat(floatToBytes(m.tilt), u16ToBytes(m.spd), u16ToBytes(m.acc)));
+    };
+    document.getElementById('cmdPanTiltMove').onclick = function () {
+      const m = getMove();
+      sendCommand(134, floatToBytes(m.pan).concat(floatToBytes(m.tilt), u16ToBytes(m.spd), u16ToBytes(m.spd)));
+    };
+    document.getElementById('cmdPanOnlyAbs').onclick = function () {
+      const m = getMove();
+      sendCommand(172, floatToBytes(m.pan).concat(u16ToBytes(m.spd), u16ToBytes(m.acc)));
+    };
+    document.getElementById('cmdTiltOnlyAbs').onclick = function () {
+      const m = getMove();
+      sendCommand(173, floatToBytes(m.tilt).concat(u16ToBytes(m.spd), u16ToBytes(m.acc)));
+    };
+    document.getElementById('cmdPanOnlyMove').onclick = function () {
+      const m = getMove();
+      sendCommand(174, floatToBytes(m.pan).concat(u16ToBytes(m.spd)));
+    };
+    document.getElementById('cmdTiltOnlyMove').onclick = function () {
+      const m = getMove();
+      sendCommand(175, floatToBytes(m.tilt).concat(u16ToBytes(m.spd)));
+    };
+    document.getElementById('cmdStop').onclick = function () {
+      sendCommand(135, []);
+      gimbalState = 'idle';
+      setConfigVisible(true);
+    };
+
+    // Sliders sync with number inputs (Move) and send to motor when updated (debounced)
+    const sliderPan = document.getElementById('sliderPan');
+    const sliderTilt = document.getElementById('sliderTilt');
+    const movePanInput = document.getElementById('movePan');
+    const moveTiltInput = document.getElementById('moveTilt');
+    const SLIDER_DEBOUNCE_MS = 120;
+    let panSliderDebounce = null;
+    let tiltSliderDebounce = null;
+    sliderPan.addEventListener('input', function () {
+      movePanInput.value = sliderPan.value;
+      clearTimeout(panSliderDebounce);
+      panSliderDebounce = setTimeout(function () {
+        const m = getMove();
+        const pan = parseFloat(sliderPan.value) || 0;
+        sendCommand(172, floatToBytes(pan).concat(u16ToBytes(m.spd), u16ToBytes(m.acc)));
+        panSliderDebounce = null;
+      }, SLIDER_DEBOUNCE_MS);
+    });
+    sliderTilt.addEventListener('input', function () {
+      moveTiltInput.value = sliderTilt.value;
+      clearTimeout(tiltSliderDebounce);
+      tiltSliderDebounce = setTimeout(function () {
+        const m = getMove();
+        const tilt = parseFloat(sliderTilt.value) || 0;
+        sendCommand(173, floatToBytes(tilt).concat(u16ToBytes(m.spd), u16ToBytes(m.acc)));
+        tiltSliderDebounce = null;
+      }, SLIDER_DEBOUNCE_MS);
+    });
+    movePanInput.addEventListener('input', function () {
+      const v = Math.max(-180, Math.min(180, parseInt(movePanInput.value, 10) || 0));
+      sliderPan.value = v;
+      movePanInput.value = v;
+    });
+    moveTiltInput.addEventListener('input', function () {
+      const v = Math.max(-90, Math.min(120, parseInt(moveTiltInput.value, 10) || 0));
+      sliderTilt.value = v;
+      moveTiltInput.value = v;
+    });
+
+    // Lock
+    document.getElementById('cmdPanLock').onclick = function () { sendCommand(170, [1]); };
+    document.getElementById('cmdPanUnlock').onclick = function () { sendCommand(170, [0]); };
+    document.getElementById('cmdTiltLock').onclick = function () { sendCommand(171, [1]); };
+    document.getElementById('cmdTiltUnlock').onclick = function () { sendCommand(171, [0]); };
+
+    // Settings
+    document.getElementById('cmdFbOn').onclick = function () { sendCommand(131, [1]); };
+    document.getElementById('cmdFbOff').onclick = function () { sendCommand(131, [0]); };
+    document.getElementById('cmdFbInterval').onclick = function () {
+      const ms = parseInt(document.getElementById('fbInterval').value, 10) || 100;
+      sendCommand(142, u16ToBytes(ms));
+    };
+    document.getElementById('cmdHeartbeat').onclick = function () {
+      const ms = parseInt(document.getElementById('heartbeatMs').value, 10) || 0;
+      sendCommand(136, u16ToBytes(ms));
+    };
+
+    // User ctrl (141): X(1), Y(1), SPD(2)
+    document.getElementById('cmdUserCtrl').onclick = function () {
+      const x = parseInt(document.getElementById('userX').value, 10) || 0;
+      const y = parseInt(document.getElementById('userY').value, 10) || 0;
+      const spd = parseInt(document.getElementById('userSpd').value, 10) || 300;
+      sendCommand(141, [i8ToByte(x), i8ToByte(y)].concat(u16ToBytes(spd)));
+    };
+
+    // Query
+    document.getElementById('cmdGetImu').onclick = function () { sendCommand(126, []); };
+    document.getElementById('cmdGetIna').onclick = function () { sendCommand(160, []); };
+
+    // Config / diagnostics
+    document.getElementById('cmdPing').onclick = function () {
+      const id = parseInt(document.getElementById('pingId').value, 10) || 1;
+      sendCommand(200, [id]);
+    };
+    document.getElementById('cmdReadByte').onclick = function () {
+      const id = parseInt(document.getElementById('readId').value, 10) || 1;
+      const addr = parseInt(document.getElementById('readAddr').value, 10) || 0;
+      sendCommand(210, [id, addr]);
+    };
+    document.getElementById('cmdReadWord').onclick = function () {
+      const id = parseInt(document.getElementById('readId').value, 10) || 1;
+      const addr = parseInt(document.getElementById('readAddr').value, 10) || 0;
+      sendCommand(212, [id, addr]);
+    };
+    document.getElementById('cmdWriteByte').onclick = function () {
+      const id = parseInt(document.getElementById('writeId').value, 10) || 1;
+      const addr = parseInt(document.getElementById('writeAddr').value, 10) || 0;
+      const val = parseInt(document.getElementById('writeVal').value, 10) & 0xff;
+      sendCommand(211, [id, addr, val]);
+    };
+    document.getElementById('cmdWriteWord').onclick = function () {
+      const id = parseInt(document.getElementById('writeId').value, 10) || 1;
+      const addr = parseInt(document.getElementById('writeAddr').value, 10) || 0;
+      const val = parseInt(document.getElementById('writeVal').value, 10) & 0xffff;
+      sendCommand(213, [id, addr].concat(u16ToBytes(val)));
+    };
+    document.getElementById('cmdSetId').onclick = function () {
+      if (!confirm('Set servo ID changes hardware. Continue?')) return;
+      const fromId = parseInt(document.getElementById('setIdFrom').value, 10) || 1;
+      const toId = parseInt(document.getElementById('setIdTo').value, 10) || 2;
+      sendCommand(501, [fromId, toId]);
+    };
+    document.getElementById('cmdCalibrate').onclick = function () {
+      if (!confirm('Calibrate sets current position as middle. Continue?')) return;
+      const id = parseInt(document.getElementById('calId').value, 10) || 1;
+      sendCommand(502, [id]);
+    };
+  </script>
+</body>
+</html>

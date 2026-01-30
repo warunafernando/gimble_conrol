@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <ArduinoJson.h>
 #include <SCServo.h>
 #include <INA219_WE.h>
 #include "IMU.h"
@@ -66,11 +65,26 @@ static const int FEEDBACK_INA = 1010;
 static const int FEEDBACK_SERVO = 1011;
 static const int FEEDBACK_HEARTBEAT = 1012;
 
-// ----------------------------- Globals -----------------------------
-StaticJsonDocument<256> jsonCmdReceive;
-StaticJsonDocument<512> jsonOut;
+// Binary protocol (GIMBAL_PROTOCOL.md)
+static const uint8_t STX = 0x02;
+static const uint8_t ETX = 0x03;
+static const uint16_t RSP_ACK_RECEIVED = 1;
+static const uint16_t RSP_ACK_EXECUTED = 2;
+static const uint16_t RSP_NACK = 3;
+static const uint16_t CMD_ENTER_TRACKING = 137;
+static const uint16_t CMD_ENTER_CONFIG = 139;
+static const uint16_t CMD_EXIT_CONFIG = 140;
 
-String serialBuffer;
+static const size_t FRAME_BUF_SIZE = 512;
+static const size_t MAX_PAYLOAD = 251;
+
+// ----------------------------- State machine -----------------------------
+enum GimbalState { IDLE, TRACKING, CONFIG };
+static GimbalState gimbalState = IDLE;
+
+// ----------------------------- Globals -----------------------------
+static uint8_t frameBuf[FRAME_BUF_SIZE];
+static size_t frameLen = 0;
 
 SMS_STS st;
 
@@ -122,6 +136,47 @@ uint32_t lastFeedbackMs = 0;
 uint32_t lastPanCmdMs = 0;
 uint32_t lastTiltCmdMs = 0;
 
+static volatile bool controlTick = false;
+static uint16_t lastPanPosTracking = SERVO_CENTER;
+static uint16_t lastTiltPosTracking = SERVO_CENTER;
+static hw_timer_t* controlTimer = nullptr;
+
+// ----------------------------- CRC8 (poly 0x07, init 0x00) -----------------------------
+static uint8_t crc8(const uint8_t* data, size_t len) {
+  uint8_t crc = 0x00;
+  while (len--) {
+    crc ^= *data++;
+    for (int i = 0; i < 8; i++)
+      crc = (crc & 0x80) ? (uint8_t)(0x07 ^ (crc << 1)) : (uint8_t)(crc << 1);
+  }
+  return crc;
+}
+
+// Build and send binary frame: STX LEN SEQ TYPE PAYLOAD CHECKSUM ETX
+static void sendFrame(uint16_t seq, uint16_t type, const uint8_t* payload, size_t payloadLen) {
+  if (payloadLen > MAX_PAYLOAD) return;
+  uint8_t len = (uint8_t)(4 + payloadLen);  // SEQ(2) + TYPE(2) + PAYLOAD
+  uint8_t buf[8 + MAX_PAYLOAD];
+  size_t i = 0;
+  buf[i++] = STX;
+  buf[i++] = len;
+  buf[i++] = (uint8_t)(seq & 0xFF);
+  buf[i++] = (uint8_t)(seq >> 8);
+  buf[i++] = (uint8_t)(type & 0xFF);
+  buf[i++] = (uint8_t)(type >> 8);
+  for (size_t j = 0; j < payloadLen; j++) buf[i++] = payload[j];
+  uint8_t* crcStart = &buf[1];
+  buf[i++] = crc8(crcStart, (size_t)(len + 1));
+  buf[i++] = ETX;
+  Serial.write(buf, i);
+}
+
+// NACK: code 1=checksum, 2=unknown type, 3=state rejected, 4=execution failed
+static void sendNack(uint16_t seq, uint8_t code) {
+  uint8_t pl[] = { code };
+  sendFrame(seq, RSP_NACK, pl, 1);
+}
+
 // ----------------------------- Helpers -----------------------------
 static float clampFloat(float value, float minValue, float maxValue) {
   if (value < minValue) return minValue;
@@ -145,7 +200,6 @@ static void touchHeartbeat() {
 }
 
 static bool readServoFeedback(uint8_t id, ServoFeedback &out) {
-  // Add small delay to avoid bus conflicts
   delay(5);
   if (st.FeedBack(id) == -1) {
     out.ok = false;
@@ -160,6 +214,17 @@ static bool readServoFeedback(uint8_t id, ServoFeedback &out) {
   out.temp = st.ReadTemper(-1);
   out.mode = st.ReadMode(id);
   return true;
+}
+
+// No-delay path for TRACKING: read load and pos only (for ACK_EXECUTED)
+static void readServoFeedbackTracking(uint8_t id, int16_t* load, int16_t* pos) {
+  if (st.FeedBack(id) == -1) {
+    *load = 0;
+    *pos = 0;
+    return;
+  }
+  *load = (int16_t)st.ReadLoad(-1);
+  *pos = (int16_t)st.ReadPos(-1);
 }
 
 static void lockAxis(uint8_t id, ServoFeedback &fb, bool &lockedFlag) {
@@ -221,6 +286,77 @@ static void setTiltServoAngleLimits() {
     st.LockEprom(TILT_SERVO_ID);
     delay(10);
   }
+}
+
+// One-time servo prep on TRACKING entry (no per-move EPROM/delays)
+static void onEnterTracking() {
+  ensurePositionMode(PAN_SERVO_ID);
+  ensurePositionMode(TILT_SERVO_ID);
+  delay(5);
+  setServoTorqueLimitMax(PAN_SERVO_ID);
+  setServoTorqueLimitMax(TILT_SERVO_ID);
+  delay(5);
+  st.EnableTorque(PAN_SERVO_ID, 1);
+  st.EnableTorque(TILT_SERVO_ID, 1);
+  panLocked = false;
+  tiltLocked = false;
+}
+
+// Fast path: no delay, no EPROM, no ensurePositionMode per move
+static void setPanTiltAbsTracking(float panDeg, float tiltDeg, uint16_t spd, uint16_t acc) {
+  uint16_t posPan = panDegToPos(panDeg);
+  uint16_t posTilt = tiltDegToPos(tiltDeg);
+  lastPanPosTracking = posPan;
+  lastTiltPosTracking = posTilt;
+  uint8_t ids[2] = {PAN_SERVO_ID, TILT_SERVO_ID};
+  int16_t pos[2] = {(int16_t)posPan, (int16_t)posTilt};
+  uint16_t spdArr[2] = {spd, spd};
+  uint8_t accArr[2] = {(uint8_t)acc, (uint8_t)acc};
+  st.SyncWritePosEx(ids, 2, pos, spdArr, accArr);
+  panTargetDeg = panDeg;
+  tiltTargetDeg = tiltDeg;
+}
+
+static void setPanTiltMoveTracking(float panDeg, float tiltDeg, uint16_t spdPan, uint16_t spdTilt) {
+  uint16_t posPan = panDegToPos(panDeg);
+  uint16_t posTilt = tiltDegToPos(tiltDeg);
+  lastPanPosTracking = posPan;
+  lastTiltPosTracking = posTilt;
+  uint8_t ids[2] = {PAN_SERVO_ID, TILT_SERVO_ID};
+  int16_t pos[2] = {(int16_t)posPan, (int16_t)posTilt};
+  uint16_t spdArr[2] = {spdPan, spdTilt};
+  uint8_t accArr[2] = {0, 0};
+  st.SyncWritePosEx(ids, 2, pos, spdArr, accArr);
+  panTargetDeg = panDeg;
+  tiltTargetDeg = tiltDeg;
+}
+
+static void setPanAbsTracking(float panDeg, uint16_t spd, uint16_t acc) {
+  uint16_t posPan = panDegToPos(panDeg);
+  lastPanPosTracking = posPan;
+  st.WritePosEx(PAN_SERVO_ID, posPan, spd, acc);
+  panTargetDeg = panDeg;
+}
+
+static void setTiltAbsTracking(float tiltDeg, uint16_t spd, uint16_t acc) {
+  uint16_t posTilt = tiltDegToPos(tiltDeg);
+  lastTiltPosTracking = posTilt;
+  st.WritePosEx(TILT_SERVO_ID, posTilt, spd, acc);
+  tiltTargetDeg = tiltDeg;
+}
+
+static void setPanMoveTracking(float panDeg, uint16_t spd) {
+  uint16_t posPan = panDegToPos(panDeg);
+  lastPanPosTracking = posPan;
+  st.WritePosEx(PAN_SERVO_ID, posPan, spd, 0);
+  panTargetDeg = panDeg;
+}
+
+static void setTiltMoveTracking(float tiltDeg, uint16_t spd) {
+  uint16_t posTilt = tiltDegToPos(tiltDeg);
+  lastTiltPosTracking = posTilt;
+  st.WritePosEx(TILT_SERVO_ID, posTilt, spd, 0);
+  tiltTargetDeg = tiltDeg;
 }
 
 static void setPanTiltAbs(float panDeg, float tiltDeg, uint16_t spd, uint16_t acc) {
@@ -378,78 +514,60 @@ static void updateIna219() {
   ina219_overflow = ina219.getOverflow();
 }
 
-static void sendImuFeedback() {
-  jsonOut.clear();
-  jsonOut["T"] = FEEDBACK_IMU;
-  jsonOut["r"] = imuAngles.roll;
-  jsonOut["p"] = imuAngles.pitch;
-  jsonOut["y"] = imuAngles.yaw;
-  jsonOut["ax"] = imuAccel.X;
-  jsonOut["ay"] = imuAccel.Y;
-  jsonOut["az"] = imuAccel.Z;
-  jsonOut["gx"] = imuGyro.X;
-  jsonOut["gy"] = imuGyro.Y;
-  jsonOut["gz"] = imuGyro.Z;
-  jsonOut["mx"] = imuMagn.s16X;
-  jsonOut["my"] = imuMagn.s16Y;
-  jsonOut["mz"] = imuMagn.s16Z;
-  jsonOut["temp"] = imuTemp;
-  String out;
-  serializeJson(jsonOut, out);
-  Serial.println(out);
+// Binary IMU response: 50 bytes per GIMBAL_PROTOCOL
+static void sendImuBinary(uint16_t seq) {
+  updateImu();
+  uint8_t buf[50];
+  size_t i = 0;
+  memcpy(&buf[i], &imuAngles.roll, 4); i += 4;
+  memcpy(&buf[i], &imuAngles.pitch, 4); i += 4;
+  memcpy(&buf[i], &imuAngles.yaw, 4); i += 4;
+  memcpy(&buf[i], &imuAccel.X, 4); i += 4;
+  memcpy(&buf[i], &imuAccel.Y, 4); i += 4;
+  memcpy(&buf[i], &imuAccel.Z, 4); i += 4;
+  memcpy(&buf[i], &imuGyro.X, 4); i += 4;
+  memcpy(&buf[i], &imuGyro.Y, 4); i += 4;
+  memcpy(&buf[i], &imuGyro.Z, 4); i += 4;
+  int16_t mx = (int16_t)imuMagn.s16X, my = (int16_t)imuMagn.s16Y, mz = (int16_t)imuMagn.s16Z;
+  memcpy(&buf[i], &mx, 2); i += 2;
+  memcpy(&buf[i], &my, 2); i += 2;
+  memcpy(&buf[i], &mz, 2); i += 2;
+  memcpy(&buf[i], &imuTemp, 4); i += 4;
+  sendFrame(seq, FEEDBACK_IMU, buf, 50);
 }
 
-static void sendInaFeedback() {
-  jsonOut.clear();
-  jsonOut["T"] = FEEDBACK_INA;
-  jsonOut["bus_v"] = busVoltage_V;
-  jsonOut["shunt_mv"] = shuntVoltage_mV;
-  jsonOut["load_v"] = loadVoltage_V;
-  jsonOut["current_ma"] = current_mA;
-  jsonOut["power_mw"] = power_mW;
-  jsonOut["overflow"] = ina219_overflow ? 1 : 0;
-  String out;
-  serializeJson(jsonOut, out);
-  Serial.println(out);
+// Binary INA response: 21 bytes
+static void sendInaBinary(uint16_t seq) {
+  updateIna219();
+  uint8_t buf[21];
+  size_t i = 0;
+  memcpy(&buf[i], &busVoltage_V, 4); i += 4;
+  memcpy(&buf[i], &shuntVoltage_mV, 4); i += 4;
+  memcpy(&buf[i], &loadVoltage_V, 4); i += 4;
+  memcpy(&buf[i], &current_mA, 4); i += 4;
+  memcpy(&buf[i], &power_mW, 4); i += 4;
+  buf[i++] = ina219_overflow ? 1 : 0;
+  sendFrame(seq, FEEDBACK_INA, buf, 21);
 }
 
-static void sendServoFeedback() {
-  // Only read feedback when explicitly requested, not periodically
-  // This avoids interference with movement commands
+static void sendServoFeedbackBinary(uint16_t seq) {
   readServoFeedback(PAN_SERVO_ID, panFb);
-  delay(10);  // Small delay between reads to avoid bus conflicts
+  delay(10);
   readServoFeedback(TILT_SERVO_ID, tiltFb);
-  jsonOut.clear();
-  jsonOut["T"] = FEEDBACK_SERVO;
-  JsonObject pan = jsonOut.createNestedObject("pan");
-  pan["id"] = PAN_SERVO_ID;
-  pan["pos"] = panFb.pos;
-  pan["speed"] = panFb.speed;
-  pan["load"] = panFb.load;
-  pan["v"] = panFb.voltage;
-  pan["temp"] = panFb.temp;
-  pan["mode"] = panFb.mode;
-  JsonObject tilt = jsonOut.createNestedObject("tilt");
-  tilt["id"] = TILT_SERVO_ID;
-  tilt["pos"] = tiltFb.pos;
-  tilt["speed"] = tiltFb.speed;
-  tilt["load"] = tiltFb.load;
-  tilt["v"] = tiltFb.voltage;
-  tilt["temp"] = tiltFb.temp;
-  tilt["mode"] = tiltFb.mode;
-  String out;
-  serializeJson(jsonOut, out);
-  Serial.println(out);
+  uint8_t buf[8];
+  buf[0] = (uint8_t)(panFb.pos & 0xFF); buf[1] = (uint8_t)(panFb.pos >> 8);
+  buf[2] = (uint8_t)(panFb.load & 0xFF); buf[3] = (uint8_t)(panFb.load >> 8);
+  buf[4] = (uint8_t)(tiltFb.pos & 0xFF); buf[5] = (uint8_t)(tiltFb.pos >> 8);
+  buf[6] = (uint8_t)(tiltFb.load & 0xFF); buf[7] = (uint8_t)(tiltFb.load >> 8);
+  sendFrame(seq, FEEDBACK_SERVO, buf, 8);
 }
 
-static void sendHeartbeatStatus() {
-  jsonOut.clear();
-  jsonOut["T"] = FEEDBACK_HEARTBEAT;
-  jsonOut["alive"] = heartbeatStopActive ? 0 : 1;
-  jsonOut["timeout_ms"] = heartbeatTimeoutMs;
-  String out;
-  serializeJson(jsonOut, out);
-  Serial.println(out);
+static void sendHeartbeatBinary(uint16_t seq) {
+  uint8_t buf[3];
+  buf[0] = heartbeatStopActive ? 0 : 1;
+  buf[1] = (uint8_t)(heartbeatTimeoutMs & 0xFF);
+  buf[2] = (uint8_t)(heartbeatTimeoutMs >> 8);
+  sendFrame(seq, FEEDBACK_HEARTBEAT, buf, 3);
 }
 
 static void handleUserCtrl(int x, int y, int spd) {
@@ -477,319 +595,324 @@ static void handleUserCtrl(int x, int y, int spd) {
   }
 }
 
-static void processCommand() {
-  int cmd = jsonCmdReceive["T"] | -1;
-  switch (cmd) {
+// Send ACK_EXECUTED with 8-byte move feedback (pan_load, pan_pos, tilt_load, tilt_pos)
+static void sendMoveFeedback(uint16_t seq) {
+  int16_t panLoad, panPos, tiltLoad, tiltPos;
+  readServoFeedbackTracking(PAN_SERVO_ID, &panLoad, &panPos);
+  readServoFeedbackTracking(TILT_SERVO_ID, &tiltLoad, &tiltPos);
+  uint8_t buf[8];
+  buf[0] = (uint8_t)((uint16_t)panLoad & 0xFF); buf[1] = (uint8_t)((uint16_t)panLoad >> 8);
+  buf[2] = (uint8_t)((uint16_t)panPos & 0xFF); buf[3] = (uint8_t)((uint16_t)panPos >> 8);
+  buf[4] = (uint8_t)((uint16_t)tiltLoad & 0xFF); buf[5] = (uint8_t)((uint16_t)tiltLoad >> 8);
+  buf[6] = (uint8_t)((uint16_t)tiltPos & 0xFF); buf[7] = (uint8_t)((uint16_t)tiltPos >> 8);
+  sendFrame(seq, RSP_ACK_EXECUTED, buf, 8);
+}
+
+static bool isConfigType(uint16_t type) {
+  return type == 200 || type == 501 || type == 210 || type == 211 || type == 212 || type == 213 || type == 502;
+}
+static bool isMoveType(uint16_t type) {
+  return type == 133 || type == 134 || type == 135 || type == 172 || type == 173 || type == 174 || type == 175;
+}
+
+static void processCommand(uint16_t seq, uint16_t type, const uint8_t* payload, size_t payloadLen) {
+  if (gimbalState == TRACKING && isConfigType(type)) {
+    sendNack(seq, 3);
+    return;
+  }
+  if (gimbalState == CONFIG && isMoveType(type)) {
+    sendNack(seq, 3);
+    return;
+  }
+
+  switch (type) {
+    case CMD_ENTER_TRACKING:
+      gimbalState = TRACKING;
+      onEnterTracking();
+      sendFrame(seq, RSP_ACK_EXECUTED, nullptr, 0);
+      break;
+    case CMD_ENTER_CONFIG:
+      gimbalState = CONFIG;
+      sendFrame(seq, RSP_ACK_EXECUTED, nullptr, 0);
+      break;
+    case CMD_EXIT_CONFIG:
+      gimbalState = IDLE;
+      sendFrame(seq, RSP_ACK_EXECUTED, nullptr, 0);
+      break;
+
     case CMD_PAN_TILT_ABS: {
-      if (!jsonCmdReceive.containsKey("X") || !jsonCmdReceive.containsKey("Y")) return;
-      float pan = jsonCmdReceive["X"];
-      float tilt = jsonCmdReceive["Y"];
-      // High torque defaults: speed=3400 (max), acc=100 (high acceleration)
-      uint16_t spd = jsonCmdReceive["SPD"] | 3400;
-      uint16_t acc = jsonCmdReceive["ACC"] | 100;
-      setPanTiltAbs(pan, tilt, spd, acc);
-      lastPanCmdMs = millis();
-      lastTiltCmdMs = millis();
-      touchHeartbeat();
+      if (payloadLen < 12) { sendNack(seq, 4); return; }
+      float pan, tilt;
+      memcpy(&pan, &payload[0], 4); memcpy(&tilt, &payload[4], 4);
+      uint16_t spd = (uint16_t)payload[8] | ((uint16_t)payload[9] << 8);
+      uint16_t acc = (uint16_t)payload[10] | ((uint16_t)payload[11] << 8);
+      if (spd == 0) spd = 3400; if (acc == 0) acc = 100;
+      lastPanCmdMs = millis(); lastTiltCmdMs = millis(); touchHeartbeat();
+      if (gimbalState == TRACKING) {
+        setPanTiltAbsTracking(pan, tilt, spd, acc);
+        sendMoveFeedback(seq);
+      } else {
+        setPanTiltAbs(pan, tilt, spd, acc);
+        sendMoveFeedback(seq);
+      }
     } break;
     case CMD_PAN_TILT_MOVE: {
-      if (!jsonCmdReceive.containsKey("X") || !jsonCmdReceive.containsKey("Y")) return;
-      float pan = jsonCmdReceive["X"];
-      float tilt = jsonCmdReceive["Y"];
-      // High torque defaults: speed=3400 (max)
-      uint16_t spdPan = jsonCmdReceive["SX"] | 3400;
-      uint16_t spdTilt = jsonCmdReceive["SY"] | 3400;
-      setPanTiltMove(pan, tilt, spdPan, spdTilt);
-      lastPanCmdMs = millis();
-      lastTiltCmdMs = millis();
-      touchHeartbeat();
+      if (payloadLen < 12) { sendNack(seq, 4); return; }
+      float pan, tilt;
+      memcpy(&pan, &payload[0], 4); memcpy(&tilt, &payload[4], 4);
+      uint16_t spdPan = (uint16_t)payload[8] | ((uint16_t)payload[9] << 8);
+      uint16_t spdTilt = (uint16_t)payload[10] | ((uint16_t)payload[11] << 8);
+      if (spdPan == 0) spdPan = 3400; if (spdTilt == 0) spdTilt = 3400;
+      lastPanCmdMs = millis(); lastTiltCmdMs = millis(); touchHeartbeat();
+      if (gimbalState == TRACKING) {
+        setPanTiltMoveTracking(pan, tilt, spdPan, spdTilt);
+        sendMoveFeedback(seq);
+      } else {
+        setPanTiltMove(pan, tilt, spdPan, spdTilt);
+        sendMoveFeedback(seq);
+      }
     } break;
     case CMD_PAN_ONLY_ABS: {
-      if (!jsonCmdReceive.containsKey("X")) return;
-      float pan = jsonCmdReceive["X"];
-      // High torque defaults: speed=3400 (max), acc=100 (high acceleration)
-      uint16_t spd = jsonCmdReceive["SPD"] | 3400;
-      uint16_t acc = jsonCmdReceive["ACC"] | 100;
-      setPanAbs(pan, spd, acc);
-      lastPanCmdMs = millis();
-      // setPanAbs already enables tilt torque to hold position
-      // No need to call lockAxis which reads/writes position
-      touchHeartbeat();
+      if (payloadLen < 8) { sendNack(seq, 4); return; }
+      float pan; memcpy(&pan, &payload[0], 4);
+      uint16_t spd = (uint16_t)payload[4] | ((uint16_t)payload[5] << 8);
+      uint16_t acc = (uint16_t)payload[6] | ((uint16_t)payload[7] << 8);
+      if (spd == 0) spd = 3400; if (acc == 0) acc = 100;
+      lastPanCmdMs = millis(); touchHeartbeat();
+      if (gimbalState == TRACKING) {
+        setPanAbsTracking(pan, spd, acc);
+        sendMoveFeedback(seq);
+      } else {
+        setPanAbs(pan, spd, acc);
+        sendMoveFeedback(seq);
+      }
     } break;
     case CMD_TILT_ONLY_ABS: {
-      if (!jsonCmdReceive.containsKey("Y")) return;
-      float tilt = jsonCmdReceive["Y"];
-      // High torque defaults: speed=3400 (max), acc=100 (high acceleration)
-      uint16_t spd = jsonCmdReceive["SPD"] | 3400;
-      uint16_t acc = jsonCmdReceive["ACC"] | 100;
-      setTiltAbs(tilt, spd, acc);
-      lastTiltCmdMs = millis();
-      // setTiltAbs already enables pan torque to hold position
-      // No need to call lockAxis which reads/writes position
-      touchHeartbeat();
+      if (payloadLen < 8) { sendNack(seq, 4); return; }
+      float tilt; memcpy(&tilt, &payload[0], 4);
+      uint16_t spd = (uint16_t)payload[4] | ((uint16_t)payload[5] << 8);
+      uint16_t acc = (uint16_t)payload[6] | ((uint16_t)payload[7] << 8);
+      if (spd == 0) spd = 3400; if (acc == 0) acc = 100;
+      lastTiltCmdMs = millis(); touchHeartbeat();
+      if (gimbalState == TRACKING) {
+        setTiltAbsTracking(tilt, spd, acc);
+        sendMoveFeedback(seq);
+      } else {
+        setTiltAbs(tilt, spd, acc);
+        sendMoveFeedback(seq);
+      }
     } break;
     case CMD_PAN_ONLY_MOVE: {
-      if (!jsonCmdReceive.containsKey("X")) return;
-      float pan = jsonCmdReceive["X"];
-      // High torque default: speed=3400 (max)
-      uint16_t spd = jsonCmdReceive["SX"] | 3400;
-      setPanMove(pan, spd);
-      lastPanCmdMs = millis();
-      // setPanMove already enables tilt torque to hold position
-      touchHeartbeat();
+      if (payloadLen < 6) { sendNack(seq, 4); return; }
+      float pan; memcpy(&pan, &payload[0], 4);
+      uint16_t spd = (uint16_t)payload[4] | ((uint16_t)payload[5] << 8);
+      if (spd == 0) spd = 3400;
+      lastPanCmdMs = millis(); touchHeartbeat();
+      if (gimbalState == TRACKING) {
+        setPanMoveTracking(pan, spd);
+        sendMoveFeedback(seq);
+      } else {
+        setPanMove(pan, spd);
+        sendMoveFeedback(seq);
+      }
     } break;
     case CMD_TILT_ONLY_MOVE: {
-      if (!jsonCmdReceive.containsKey("Y")) return;
-      float tilt = jsonCmdReceive["Y"];
-      // High torque default: speed=3400 (max)
-      uint16_t spd = jsonCmdReceive["SY"] | 3400;
-      setTiltMove(tilt, spd);
-      lastTiltCmdMs = millis();
-      // setTiltMove already enables pan torque to hold position
-      touchHeartbeat();
+      if (payloadLen < 6) { sendNack(seq, 4); return; }
+      float tilt; memcpy(&tilt, &payload[0], 4);
+      uint16_t spd = (uint16_t)payload[4] | ((uint16_t)payload[5] << 8);
+      if (spd == 0) spd = 3400;
+      lastTiltCmdMs = millis(); touchHeartbeat();
+      if (gimbalState == TRACKING) {
+        setTiltMoveTracking(tilt, spd);
+        sendMoveFeedback(seq);
+      } else {
+        setTiltMove(tilt, spd);
+        sendMoveFeedback(seq);
+      }
     } break;
     case CMD_PAN_TILT_STOP:
+      if (gimbalState == TRACKING) gimbalState = IDLE;
       stopPanTilt();
       touchHeartbeat();
+      sendFrame(seq, RSP_ACK_EXECUTED, nullptr, 0);
       break;
     case CMD_USER_CTRL: {
-      int x = jsonCmdReceive["X"] | 0;
-      int y = jsonCmdReceive["Y"] | 0;
-      int spd = jsonCmdReceive["SPD"] | 300;
+      if (payloadLen < 4) { sendNack(seq, 4); return; }
+      int8_t x = (int8_t)payload[0], y = (int8_t)payload[1];
+      uint16_t spd = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
+      if (spd == 0) spd = 300;
+      lastPanCmdMs = millis(); lastTiltCmdMs = millis(); touchHeartbeat();
       handleUserCtrl(x, y, spd);
-      lastPanCmdMs = millis();
-      lastTiltCmdMs = millis();
-      touchHeartbeat();
+      sendFrame(seq, RSP_ACK_EXECUTED, nullptr, 0);
     } break;
     case CMD_PAN_LOCK: {
-      int cmdVal = jsonCmdReceive["cmd"] | 0;
-      if (cmdVal == 1) {
-        lockAxis(PAN_SERVO_ID, panFb, panLocked);
-      } else {
-        unlockAxis(PAN_SERVO_ID, panLocked);
-      }
+      if (payloadLen < 1) { sendNack(seq, 4); return; }
+      if (payload[0] == 1) lockAxis(PAN_SERVO_ID, panFb, panLocked);
+      else unlockAxis(PAN_SERVO_ID, panLocked);
       touchHeartbeat();
+      sendFrame(seq, RSP_ACK_EXECUTED, nullptr, 0);
     } break;
     case CMD_TILT_LOCK: {
-      int cmdVal = jsonCmdReceive["cmd"] | 0;
-      if (cmdVal == 1) {
-        lockAxis(TILT_SERVO_ID, tiltFb, tiltLocked);
-      } else {
-        unlockAxis(TILT_SERVO_ID, tiltLocked);
-      }
+      if (payloadLen < 1) { sendNack(seq, 4); return; }
+      if (payload[0] == 1) lockAxis(TILT_SERVO_ID, tiltFb, tiltLocked);
+      else unlockAxis(TILT_SERVO_ID, tiltLocked);
       touchHeartbeat();
+      sendFrame(seq, RSP_ACK_EXECUTED, nullptr, 0);
     } break;
     case CMD_GET_IMU:
-      sendImuFeedback();
+      sendImuBinary(seq);
       break;
     case CMD_GET_INA:
-      sendInaFeedback();
+      sendInaBinary(seq);
       break;
     case CMD_FEEDBACK_FLOW:
-      feedbackEnabled = (jsonCmdReceive["cmd"] | 0) == 1;
+      if (payloadLen >= 1) feedbackEnabled = (payload[0] == 1);
+      sendFrame(seq, RSP_ACK_EXECUTED, nullptr, 0);
       break;
     case CMD_FEEDBACK_INTERVAL:
-      feedbackIntervalMs = jsonCmdReceive["cmd"] | DEFAULT_FEEDBACK_MS;
+      if (payloadLen >= 2) feedbackIntervalMs = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+      if (feedbackIntervalMs == 0) feedbackIntervalMs = DEFAULT_FEEDBACK_MS;
+      sendFrame(seq, RSP_ACK_EXECUTED, nullptr, 0);
       break;
     case CMD_HEARTBEAT_SET:
-      heartbeatTimeoutMs = jsonCmdReceive["cmd"] | DEFAULT_HEARTBEAT_MS;
+      if (payloadLen >= 2) heartbeatTimeoutMs = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+      sendFrame(seq, RSP_ACK_EXECUTED, nullptr, 0);
       break;
     case CMD_PING_SERVO: {
-      // Diagnostic: Ping a servo ID to see if it responds
-      int testId = jsonCmdReceive["id"] | 1;
+      if (payloadLen < 1) { sendNack(seq, 4); return; }
+      uint8_t testId = payload[0]; if (testId == 0) testId = 1;
       int result = st.Ping(testId);
       byte mode = st.ReadMode(testId);
       int torqueLimit = st.readWord(testId, SMS_STS_TORQUE_LIMIT_L);
       byte torqueEnable = st.readByte(testId, SMS_STS_TORQUE_ENABLE);
       int pos = st.ReadPos(testId);
-      jsonOut.clear();
-      jsonOut["T"] = 2001;  // Ping response
-      jsonOut["id"] = testId;
-      jsonOut["responded"] = (result == testId) ? 1 : 0;
-      jsonOut["result"] = result;
-      jsonOut["mode"] = mode;  // 0=position, 1=wheel
-      jsonOut["torque_limit"] = torqueLimit;
-      jsonOut["torque_enable"] = torqueEnable;
-      jsonOut["position"] = pos;
-      String out;
-      serializeJson(jsonOut, out);
-      Serial.println(out);
-      break;
-    }
+      uint8_t buf[9];
+      buf[0] = testId;
+      buf[1] = (result == (int)testId) ? 1 : 0;
+      buf[2] = (uint8_t)(result & 0xFF);
+      buf[3] = mode;
+      buf[4] = (uint8_t)(torqueLimit & 0xFF); buf[5] = (uint8_t)(torqueLimit >> 8);
+      buf[6] = torqueEnable;
+      buf[7] = (uint8_t)(pos & 0xFF); buf[8] = (uint8_t)(pos >> 8);
+      sendFrame(seq, (uint16_t)2001, buf, 9);
+    } break;
     case CMD_SET_SERVO_ID: {
-      // Change servo ID: {"T":501,"from":1,"to":2}
-      // Process: 1) Unlock EPROM, 2) Write new ID, 3) Lock EPROM
-      int fromId = jsonCmdReceive["from"] | 1;
-      int toId = jsonCmdReceive["to"] | 2;
-      
+      if (payloadLen < 2) { sendNack(seq, 4); return; }
+      uint8_t fromId = payload[0], toId = payload[1];
       if (fromId < 1 || fromId > 254 || toId < 1 || toId > 254) {
-        jsonOut.clear();
-        jsonOut["T"] = 5001;  // Error response
-        jsonOut["error"] = "Invalid ID range (1-254)";
-        String out;
-        serializeJson(jsonOut, out);
-        Serial.println(out);
-        break;
+        sendNack(seq, 4);
+        return;
       }
-      
-      // Unlock EPROM
-      if (st.unLockEprom(fromId) == -1) {
-        jsonOut.clear();
-        jsonOut["T"] = 5001;
-        jsonOut["error"] = "Failed to unlock EPROM";
-        String out;
-        serializeJson(jsonOut, out);
-        Serial.println(out);
-        break;
-      }
-      
-      delay(50);  // Small delay after unlock
-      
-      // Write new ID to address SMS_STS_ID (5)
-      // SMS_STS_ID is defined in SCServo library header
-      #define SERVO_ID_ADDR 5  // SMS_STS_ID address
-      if (st.writeByte(fromId, SERVO_ID_ADDR, toId) == -1) {
-        jsonOut.clear();
-        jsonOut["T"] = 5001;
-        jsonOut["error"] = "Failed to write new ID";
-        String out;
-        serializeJson(jsonOut, out);
-        Serial.println(out);
-        break;
-      }
-      
-      delay(50);  // Small delay after write
-      
-      // Lock EPROM with new ID
-      if (st.LockEprom(toId) == -1) {
-        jsonOut.clear();
-        jsonOut["T"] = 5001;
-        jsonOut["error"] = "Failed to lock EPROM";
-        String out;
-        serializeJson(jsonOut, out);
-        Serial.println(out);
-        break;
-      }
-      
-      // Success response
-      jsonOut.clear();
-      jsonOut["T"] = 5002;  // Success response
-      jsonOut["from"] = fromId;
-      jsonOut["to"] = toId;
-      jsonOut["status"] = "success";
-      String out;
-      serializeJson(jsonOut, out);
-      Serial.println(out);
-      
-      // Verify by pinging new ID
+      if (st.unLockEprom(fromId) == -1) { sendNack(seq, 4); return; }
+      delay(50);
+      #define SERVO_ID_ADDR 5
+      if (st.writeByte(fromId, SERVO_ID_ADDR, toId) == -1) { sendNack(seq, 4); return; }
+      delay(50);
+      if (st.LockEprom(toId) == -1) { sendNack(seq, 4); return; }
+      uint8_t okBuf[2] = { fromId, toId };
+      sendFrame(seq, (uint16_t)5002, okBuf, 2);
       delay(100);
       int verifyResult = st.Ping(toId);
-      jsonOut.clear();
-      jsonOut["T"] = 5003;  // Verification response
-      jsonOut["id"] = toId;
-      jsonOut["verified"] = (verifyResult == toId) ? 1 : 0;
-      String out2;
-      serializeJson(jsonOut, out2);
-      Serial.println(out2);
-      break;
-    }
+      uint8_t verifyBuf[2] = { (uint8_t)toId, (uint8_t)((verifyResult == (int)toId) ? 1 : 0) };
+      sendFrame(seq, (uint16_t)5003, verifyBuf, 2);
+    } break;
     case CMD_READ_BYTE: {
-      int id = jsonCmdReceive["id"] | 1;
-      int addr = jsonCmdReceive["addr"] | 40;
-      int val = st.readByte(id, (uint8_t)addr);
-      jsonOut.clear();
-      jsonOut["T"] = 2101;
-      jsonOut["id"] = id;
-      jsonOut["addr"] = addr;
-      jsonOut["value"] = val;
-      String out;
-      serializeJson(jsonOut, out);
-      Serial.println(out);
-      break;
-    }
+      if (payloadLen < 2) { sendNack(seq, 4); return; }
+      uint8_t id = payload[0], addr = payload[1];
+      int val = st.readByte(id, addr);
+      uint8_t buf[3] = { id, addr, (uint8_t)(val & 0xFF) };
+      sendFrame(seq, (uint16_t)2101, buf, 3);
+    } break;
     case CMD_WRITE_BYTE: {
-      int id = jsonCmdReceive["id"] | 1;
-      int addr = jsonCmdReceive["addr"] | 40;
-      int value = jsonCmdReceive["value"] | 0;
+      if (payloadLen < 3) { sendNack(seq, 4); return; }
+      uint8_t id = payload[0], addr = payload[1], value = payload[2];
       bool eprom = (addr >= 5 && addr <= 33 && addr != 3 && addr != 4);
       if (eprom) { st.unLockEprom(id); delay(10); }
-      int ret = st.writeByte(id, (uint8_t)addr, (uint8_t)(value & 0xFF));
+      int ret = st.writeByte(id, addr, value);
       if (eprom) { delay(10); st.LockEprom(id); }
-      jsonOut.clear();
-      jsonOut["T"] = 2111;
-      jsonOut["id"] = id;
-      jsonOut["addr"] = addr;
-      jsonOut["ok"] = (ret != -1) ? 1 : 0;
-      String out;
-      serializeJson(jsonOut, out);
-      Serial.println(out);
-      break;
-    }
+      uint8_t buf[3] = { id, addr, (uint8_t)((ret != -1) ? 1 : 0) };
+      sendFrame(seq, (uint16_t)2111, buf, 3);
+    } break;
     case CMD_READ_WORD: {
-      int id = jsonCmdReceive["id"] | 1;
-      int addr = jsonCmdReceive["addr"] | 42;
-      int val = st.readWord(id, (uint8_t)addr);
-      jsonOut.clear();
-      jsonOut["T"] = 2121;
-      jsonOut["id"] = id;
-      jsonOut["addr"] = addr;
-      jsonOut["value"] = val;
-      String out;
-      serializeJson(jsonOut, out);
-      Serial.println(out);
-      break;
-    }
+      if (payloadLen < 2) { sendNack(seq, 4); return; }
+      uint8_t id = payload[0], addr = payload[1];
+      int val = st.readWord(id, addr);
+      uint8_t buf[4];
+      buf[0] = id; buf[1] = addr; buf[2] = (uint8_t)(val & 0xFF); buf[3] = (uint8_t)(val >> 8);
+      sendFrame(seq, (uint16_t)2121, buf, 4);
+    } break;
     case CMD_WRITE_WORD: {
-      int id = jsonCmdReceive["id"] | 1;
-      int addr = jsonCmdReceive["addr"] | 48;
-      int value = jsonCmdReceive["value"] | 0;
+      if (payloadLen < 4) { sendNack(seq, 4); return; }
+      uint8_t id = payload[0], addr = payload[1];
+      uint16_t value = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
       bool eprom = (addr >= 5 && addr <= 33 && addr != 3 && addr != 4);
       if (eprom) { st.unLockEprom(id); delay(10); }
-      int ret = st.writeWord(id, (uint8_t)addr, (uint16_t)(value & 0xFFFF));
+      int ret = st.writeWord(id, addr, value);
       if (eprom) { delay(10); st.LockEprom(id); }
-      jsonOut.clear();
-      jsonOut["T"] = 2131;
-      jsonOut["id"] = id;
-      jsonOut["addr"] = addr;
-      jsonOut["ok"] = (ret != -1) ? 1 : 0;
-      String out;
-      serializeJson(jsonOut, out);
-      Serial.println(out);
-      break;
-    }
+      uint8_t buf[3] = { id, addr, (uint8_t)((ret != -1) ? 1 : 0) };
+      sendFrame(seq, (uint16_t)2131, buf, 3);
+    } break;
     case CMD_CALIBRATE: {
-      int id = jsonCmdReceive["id"] | 1;
-      int ret = st.writeByte(id, SMS_STS_TORQUE_ENABLE, 128);  // CalibrationOfs
-      jsonOut.clear();
-      jsonOut["T"] = 5021;
-      jsonOut["id"] = id;
-      jsonOut["ok"] = (ret != -1) ? 1 : 0;
-      String out;
-      serializeJson(jsonOut, out);
-      Serial.println(out);
-      break;
-    }
+      if (payloadLen < 1) { sendNack(seq, 4); return; }
+      uint8_t id = payload[0]; if (id == 0) id = 1;
+      int ret = st.writeByte(id, SMS_STS_TORQUE_ENABLE, 128);
+      uint8_t buf[2] = { id, (uint8_t)((ret != -1) ? 1 : 0) };
+      sendFrame(seq, (uint16_t)5021, buf, 2);
+    } break;
     default:
+      sendNack(seq, 2);
       break;
   }
 }
 
+// Non-blocking binary frame parser: STX LEN SEQ TYPE PAYLOAD CHECKSUM ETX
 static void serialCtrl() {
-  while (Serial.available() > 0) {
-    char c = Serial.read();
-    if (c == '\n') {
-      DeserializationError err = deserializeJson(jsonCmdReceive, serialBuffer);
-      serialBuffer = "";
-      if (err == DeserializationError::Ok) {
-        processCommand();
-      }
-    } else if (c != '\r') {
-      serialBuffer += c;
-      if (serialBuffer.length() > 512) {
-        serialBuffer = "";
-      }
-    }
+  while (Serial.available() > 0 && frameLen < FRAME_BUF_SIZE) {
+    frameBuf[frameLen++] = (uint8_t)Serial.read();
   }
+  if (frameLen < 8) return;
+  size_t stxIdx = 0;
+  for (; stxIdx < frameLen && frameBuf[stxIdx] != STX; stxIdx++) {}
+  if (stxIdx >= frameLen) {
+    frameLen = 0;
+    return;
+  }
+  if (stxIdx > 0) {
+    memmove(frameBuf, &frameBuf[stxIdx], frameLen - stxIdx);
+    frameLen -= stxIdx;
+  }
+  uint8_t len = frameBuf[1];
+  if (len < 4 || len > MAX_PAYLOAD) {
+    frameLen = 0;
+    return;
+  }
+  size_t frameSize = (size_t)(4 + len);
+  if (frameLen < frameSize) return;
+  uint8_t recvCrc = frameBuf[2 + len];
+  if (frameBuf[3 + len] != ETX) {
+    frameLen = 0;
+    return;
+  }
+  uint8_t compCrc = crc8(&frameBuf[1], (size_t)(len + 1));
+  if (recvCrc != compCrc) {
+    uint16_t seq = (uint16_t)frameBuf[2] | ((uint16_t)frameBuf[3] << 8);
+    sendNack(seq, 1);
+    memmove(frameBuf, &frameBuf[frameSize], frameLen - frameSize);
+    frameLen -= frameSize;
+    return;
+  }
+  uint16_t seq = (uint16_t)frameBuf[2] | ((uint16_t)frameBuf[3] << 8);
+  uint16_t type = (uint16_t)frameBuf[4] | ((uint16_t)frameBuf[5] << 8);
+  const uint8_t* payload = (len > 4) ? &frameBuf[6] : nullptr;
+  size_t payloadLen = (size_t)(len - 4);
+  sendFrame(seq, RSP_ACK_RECEIVED, nullptr, 0);
+  processCommand(seq, type, payload, payloadLen);
+  memmove(frameBuf, &frameBuf[frameSize], frameLen - frameSize);
+  frameLen -= frameSize;
+}
+
+void IRAM_ATTR onControlTimer() {
+  controlTick = true;
 }
 
 // ----------------------------- Setup/Loop -----------------------------
@@ -830,6 +953,11 @@ void setup() {
   tiltLocked = true; // Mark as locked
 
   lastCmdRecvTime = millis();
+
+  controlTimer = timerBegin(0, 80, true);
+  timerAttachInterrupt(controlTimer, &onControlTimer, true);
+  timerAlarmWrite(controlTimer, 10000, true);
+  timerAlarmEnable(controlTimer);
 }
 
 void loop() {
@@ -857,7 +985,7 @@ void loop() {
     if (!heartbeatStopActive) {
       stopPanTilt();
       heartbeatStopActive = true;
-      sendHeartbeatStatus();
+      sendHeartbeatBinary(0);
     }
   }
 
@@ -877,8 +1005,8 @@ void loop() {
   }
 
   if (feedbackEnabled && (now - lastFeedbackMs) >= feedbackIntervalMs) {
-    sendServoFeedback();
-    sendInaFeedback();
+    sendServoFeedbackBinary(0);
+    sendInaBinary(0);
     lastFeedbackMs = now;
   }
 }
