@@ -12,7 +12,10 @@ from flask_socketio import SocketIO, emit
 from typing import Optional
 from serial_bridge import DebugLog, SerialBridge
 from protocol import (
+    CMD_GET_FW_INFO,
     RSP_ACK_EXECUTED,
+    RSP_FW_INFO,
+    decode_fw_info,
     decode_imu,
     decode_ina,
     decode_move_feedback,
@@ -25,7 +28,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 debug_log = DebugLog(max_lines=500)
 bridge: Optional[SerialBridge] = None
 _seq = 0
-_state = {"connected": False, "port": "", "last_move": None, "last_imu": None, "last_ina": None}
+_state = {"connected": False, "port": "", "last_move": None, "last_imu": None, "last_ina": None, "last_gimbal_state": None, "fw_info": None}
 
 
 def next_seq() -> int:
@@ -59,6 +62,19 @@ def on_frame(seq: int, type_id: int, payload: bytes) -> None:
                 data["payload"] = {"error": "decode_exception", "len": len(payload)}
         else:
             data["payload"] = {"error": "payload_too_short", "len": len(payload), "expected": 21}
+    elif type_id == 1013 and len(payload) >= 1:
+        s = payload[0]
+        names = {0: "idle", 1: "tracking", 2: "config"}
+        gs = {"state": s, "stateName": names.get(s, "?")}
+        _state["last_gimbal_state"] = gs
+        data["payload"] = gs
+    elif type_id == RSP_FW_INFO:
+        fw = decode_fw_info(payload)
+        if fw:
+            _state["fw_info"] = fw
+            data["payload"] = fw
+            with app.app_context():
+                socketio.emit("fw_info", fw)
     with app.app_context():
         socketio.emit("frame", data)
 
@@ -85,7 +101,9 @@ def run_bridge(port: str, baud: int = 921600) -> bool:
     if bridge.start():
         _state["connected"] = True
         _state["port"] = port
+        _state["fw_info"] = None
         socketio.emit("state", _state)
+        bridge.send_command(next_seq(), CMD_GET_FW_INFO, b"")
         return True
     _state["connected"] = False
     _state["port"] = ""
@@ -95,13 +113,17 @@ def run_bridge(port: str, baud: int = 921600) -> bool:
 
 @app.route("/")
 def index():
-    return send_from_directory("static", "index.html")
+    r = send_from_directory("static", "index.html")
+    r.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return r
 
 
 @socketio.on("connect")
 def on_connect():
     emit("state", _state)
     emit("log_history", {"lines": debug_log.get_recent(100)})
+    if bridge and bridge._serial and bridge._serial.is_open and _state.get("connected"):
+        bridge.send_command(next_seq(), CMD_GET_FW_INFO, b"")
 
 
 @socketio.on("connect_serial")

@@ -24,7 +24,12 @@
       padding: 16px;
       min-height: 100vh;
     }
-    h1 { font-size: 1.25rem; margin: 0 0 12px 0; color: var(--accent); }
+    h1 { font-size: 1.25rem; margin: 0 0 12px 0; color: var(--accent); display: flex; align-items: center; gap: 8px; }
+    .fw-ver { font-size: 0.75rem; font-weight: normal; color: #888; }
+    .fw-panel { min-width: 200px; }
+    .fw-slot { font-size: 0.8rem; margin: 4px 0; }
+    .fw-slot .label { color: #888; }
+    .fw-slot.active .label { color: var(--ok); }
     .row { display: flex; gap: 16px; flex-wrap: wrap; }
     .panel {
       background: var(--panel);
@@ -111,9 +116,19 @@
   </style>
 </head>
 <body>
-  <h1>Gimbal Web GUI</h1>
+  <h1>Gimbal Web GUI <span id="fwVersion" class="fw-ver">—</span></h1>
 
   <div class="row">
+    <div class="panel fw-panel">
+      <h2>FW Info</h2>
+      <div class="fw-slot" id="fwSlotA">
+        <span class="label">A:</span> <span id="fwVerA">—</span> <span id="fwActiveA" class="label"></span>
+      </div>
+      <div class="fw-slot" id="fwSlotB">
+        <span class="label">B:</span> <span id="fwVerB">—</span> <span id="fwActiveB" class="label"></span>
+      </div>
+      <button id="cmdGetFwInfo" style="margin-top:6px">Get FW Info (610)</button>
+    </div>
     <div class="panel">
       <h2>Connection</h2>
       <div class="status">
@@ -167,6 +182,12 @@
     <div class="panel state-lock-row">
       <div class="state-lock-col">
         <h2>State</h2>
+        <div class="status" style="margin-bottom:6px">
+          <span class="live" id="liveGimbalState">—</span>
+        </div>
+        <div class="btn-row">
+          <button id="cmdGetState">Get state (144)</button>
+        </div>
         <div class="btn-row">
           <button id="cmdEnterTracking">Enter tracking (137)</button>
           <button id="cmdEnterConfig">Enter config (139)</button>
@@ -309,6 +330,10 @@
     socket.on('state', function (s) {
       setConnected(s.connected);
       if (s.port) portInput.value = s.port;
+      if (s.fw_info) updateFwDisplay(s.fw_info);
+    });
+    socket.on('fw_info', function (fw) {
+      updateFwDisplay(fw || {});
     });
     socket.on('frame', function (data) {
       if (data.payload) {
@@ -325,6 +350,15 @@
           } else {
             liveIna.textContent = `bus_v ${(a.bus_v != null ? a.bus_v : 0).toFixed(3)} V  load_v ${(a.load_v != null ? a.load_v : 0).toFixed(3)} V\ncurrent_ma ${(a.current_ma != null ? a.current_ma : 0).toFixed(2)} mA  power_mw ${(a.power_mw != null ? a.power_mw : 0).toFixed(1)} mW\nshunt_mv ${(a.shunt_mv != null ? a.shunt_mv : 0).toFixed(2)} mV  overflow ${a.overflow != null ? a.overflow : 0}`;
           }
+        } else if (data.type === 2610) {
+          updateFwDisplay(data.payload || {});
+        } else if (data.type === 1013) {
+          const g = data.payload || {};
+          const name = g.stateName != null ? g.stateName : (g.state === 0 ? 'idle' : g.state === 1 ? 'tracking' : g.state === 2 ? 'config' : '?');
+          const liveGimbalState = document.getElementById('liveGimbalState');
+          if (liveGimbalState) liveGimbalState.textContent = 'ESP32: ' + name;
+          gimbalState = name;
+          setConfigVisible(name !== 'tracking');
         }
       }
     });
@@ -345,6 +379,20 @@
     });
     socket.on('error', function (data) { alert(data.msg || 'Error'); });
 
+    function updateFwDisplay(fw) {
+      const va = (fw.version_a || '').trim() || '—';
+      const vb = (fw.version_b || '').trim() || '—';
+      const active = fw.active_slot === 0 ? 0 : 1;
+      document.getElementById('fwVerA').textContent = va;
+      document.getElementById('fwVerB').textContent = vb;
+      document.getElementById('fwActiveA').textContent = active === 0 ? '(active)' : '(inactive)';
+      document.getElementById('fwActiveB').textContent = active === 1 ? '(active)' : '(inactive)';
+      document.getElementById('fwSlotA').classList.toggle('active', active === 0);
+      document.getElementById('fwSlotB').classList.toggle('active', active === 1);
+      const vTitle = active === 0 ? va : vb;
+      const el = document.getElementById('fwVersion');
+      if (el) el.textContent = (vTitle && vTitle !== '—') ? 'v' + vTitle : '—';
+    }
     function escapeHtml(s) {
       const d = document.createElement('div');
       d.textContent = s;
@@ -362,6 +410,7 @@
     }
 
     // State
+    document.getElementById('cmdGetState').onclick = function () { sendCommand(144, []); };
     document.getElementById('cmdEnterTracking').onclick = function () {
       sendCommand(137, []);
       gimbalState = 'tracking';
@@ -492,6 +541,7 @@
     // Query
     document.getElementById('cmdGetImu').onclick = function () { sendCommand(126, []); };
     document.getElementById('cmdGetIna').onclick = function () { sendCommand(160, []); };
+    document.getElementById('cmdGetFwInfo').onclick = function () { sendCommand(610, []); };
 
     // Config / diagnostics
     document.getElementById('cmdPing').onclick = function () {

@@ -25,11 +25,12 @@ except ImportError:
 class WaveshareUploader:
     """Uploader that works with Waveshare auto-download circuit"""
     
-    def __init__(self, port, baud=115200):
+    def __init__(self, port, baud=115200, swap_dtr_rts=False):
         self.port = port
         self.baud = baud
         self.ser = None
         self.esp = None
+        self.swap_dtr_rts = swap_dtr_rts  # Some boards: DTR<->GPIO0, RTS<->EN
     
     def activate_auto_download(self, max_retries=3):
         """Activate the auto-download circuit using DTR/RTS sequence"""
@@ -66,31 +67,37 @@ class WaveshareUploader:
         
         try:
             
-            # Sequence that mimics Waveshare tool behavior
-            print("Sending DTR/RTS sequence...")
+            # Sequence that mimics Waveshare tool behavior.
+            # Standard: DTR=EN, RTS=GPIO0. Use --swap-dtr-rts if board has DTR=GPIO0, RTS=EN.
+            if self.swap_dtr_rts:
+                def en_low(): self.ser.setRTS(False)
+                def en_high(): self.ser.setRTS(True)
+                def gp0_low(): self.ser.setDTR(False)
+                def gp0_high(): self.ser.setDTR(True)
+            else:
+                def en_low(): self.ser.setDTR(False)
+                def en_high(): self.ser.setDTR(True)
+                def gp0_low(): self.ser.setRTS(False)
+                def gp0_high(): self.ser.setRTS(True)
+            print("Sending DTR/RTS sequence..." + (" (swap)" if self.swap_dtr_rts else ""))
             
             # Step 1: Reset (EN low) with GPIO0 high
-            self.ser.setDTR(False)  # DTR low = EN low (reset)
-            self.ser.setRTS(True)   # RTS high = GPIO0 high
+            en_low()
+            gp0_high()
             time.sleep(0.1)
-            
             # Step 2: Release reset with GPIO0 high (normal boot)
-            self.ser.setDTR(True)   # DTR high = EN high (release reset)
-            self.ser.setRTS(True)   # Keep RTS high
+            en_high()
+            gp0_high()
             time.sleep(0.05)
-            
             # Step 3: Set GPIO0 low (download mode) while resetting
-            self.ser.setDTR(False)  # DTR low = EN low (reset again)
-            self.ser.setRTS(False)  # RTS low = GPIO0 low (download mode)
+            en_low()
+            gp0_low()
             time.sleep(0.15)
-            
             # Step 4: Release reset with GPIO0 low (now in download mode)
-            self.ser.setDTR(True)   # DTR high = EN high (release reset)
-            self.ser.setRTS(False)   # Keep RTS low (GPIO0 low = download mode)
-            
-            # Wait for auto-download circuit to fully stabilize
+            en_high()
+            gp0_low()
             print("Waiting for ESP32 to enter download mode...")
-            time.sleep(1.0)  # Longer wait for circuit to stabilize
+            time.sleep(0.4)
             
             print("[OK] Auto-download circuit activated")
             print()
@@ -392,6 +399,8 @@ Examples:
     # Manual mode option (like flash_esp32_cli.py)
     parser.add_argument('--manual', action='store_true',
                        help='Manual download mode - wait for user to put ESP32 in download mode (no DTR/RTS)')
+    parser.add_argument('--swap-dtr-rts', action='store_true',
+                       help='Swap DTR/RTS (try if auto-download fails: DTR=GPIO0, RTS=EN)')
     
     args = parser.parse_args()
     
@@ -426,7 +435,7 @@ Examples:
         sys.exit(1)
     
     # Create uploader
-    uploader = WaveshareUploader(args.port, args.baud)
+    uploader = WaveshareUploader(args.port, args.baud, swap_dtr_rts=getattr(args, 'swap_dtr_rts', False))
     uploader._manual_mode = args.manual  # Pass manual mode flag to uploader
     
     try:
@@ -439,11 +448,12 @@ Examples:
             print("  1. Hold BOOT button")
             print("  2. Press and release RESET button")
             print("  3. Release BOOT button")
-            print("\nStarting upload in 5 seconds...")
+            print("\nStarting upload in 10 seconds...")
             print("(Put ESP32 in download mode NOW if you haven't already!)")
-            for i in range(5, 0, -1):
+            for i in range(10, 0, -1):
                 print(f"  {i}...")
                 time.sleep(1)
+            print("Running esptool...")
             print()
         else:
             # Activate auto-download (DTR/RTS); keep port open and flash in-process so chip stays in download mode
@@ -470,7 +480,10 @@ Examples:
         print()
         
         # Flash using open port (no close = chip stays in download mode)
+        # In manual mode, skip in-process flash and use esptool subprocess with more connect attempts
         try:
+            if args.manual:
+                raise RuntimeError("Use esptool subprocess in manual mode")
             if uploader.ser and uploader.ser.is_open:
                 # Use loader with existing serial port (no close => chip stays in download mode)
                 esp = ESP32ROM(uploader.ser)  # loader accepts Serial object when port is not str
@@ -504,6 +517,7 @@ Examples:
             before_mode = "no_reset"
             cmd = [sys.executable, "-m", "esptool", "--chip", "esp32", "--port", args.port,
                    "--baud", str(args.baud), "--before", before_mode, "--after", "hard_reset",
+                   "--connect-attempts", "15",
                    "write_flash", "-z", "--flash_mode", "dio", "--flash_freq", "80m", "--flash_size", "detect"]
             for addr, filepath in segments:
                 cmd.extend([f"0x{addr:X}", filepath])

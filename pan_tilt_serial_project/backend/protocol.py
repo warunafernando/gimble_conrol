@@ -40,6 +40,38 @@ CMD_CALIBRATE = 502
 CMD_ENTER_TRACKING = 137
 CMD_ENTER_CONFIG = 139
 CMD_EXIT_CONFIG = 140
+CMD_GET_STATE = 144
+
+# OTA Commands
+CMD_OTA_START = 600
+CMD_OTA_CHUNK = 601
+CMD_OTA_END = 602
+CMD_OTA_ABORT = 603
+
+# FW Info Commands
+CMD_GET_FW_INFO = 610
+CMD_SWITCH_FW = 611
+
+# OTA Responses
+RSP_OTA_STARTED = 2600
+RSP_OTA_CHUNK = 2601
+RSP_OTA_DONE = 2602
+RSP_OTA_NACK = 2603
+RSP_FW_INFO = 2610
+
+FW_VERSION_LEN = 32
+
+# OTA hash types
+OTA_HASH_NONE = 0
+OTA_HASH_CRC32 = 1
+OTA_HASH_SHA256 = 2
+
+# OTA error codes
+OTA_ERR_SIZE_MISMATCH = 1
+OTA_ERR_CHECKSUM_FAIL = 2
+OTA_ERR_FLASH_ERROR = 3
+OTA_ERR_TIMEOUT = 4
+OTA_ERR_ABORTED = 5
 
 
 def crc8(data: bytes) -> int:
@@ -152,6 +184,11 @@ CMD_NAMES = {
     CMD_ENTER_TRACKING: "ENTER_TRACKING",
     CMD_ENTER_CONFIG: "ENTER_CONFIG",
     CMD_EXIT_CONFIG: "EXIT_CONFIG",
+    CMD_GET_STATE: "GET_STATE",
+    CMD_OTA_START: "OTA_START",
+    CMD_OTA_CHUNK: "OTA_CHUNK",
+    CMD_OTA_END: "OTA_END",
+    CMD_OTA_ABORT: "OTA_ABORT",
 }
 RSP_NAMES = {
     RSP_ACK_RECEIVED: "ACK_RECEIVED",
@@ -161,6 +198,7 @@ RSP_NAMES = {
     1010: "INA",
     1011: "SERVO",
     1012: "HEARTBEAT_STATUS",
+    1013: "STATE",
     2001: "PING_RESP",
     5002: "SET_ID_OK",
     5003: "SET_ID_VERIFY",
@@ -170,6 +208,11 @@ RSP_NAMES = {
     2121: "READ_WORD_RESP",
     2131: "WRITE_WORD_RESP",
     5021: "CALIBRATE_RESP",
+    RSP_OTA_STARTED: "OTA_STARTED",
+    RSP_OTA_CHUNK: "OTA_CHUNK_ACK",
+    RSP_OTA_DONE: "OTA_DONE",
+    RSP_OTA_NACK: "OTA_NACK",
+    RSP_FW_INFO: "FW_INFO",
 }
 
 
@@ -210,7 +253,7 @@ def format_tx_for_log(seq: int, type_id: int, payload: bytes) -> str:
             tilt = struct.unpack_from("<f", payload, 0)[0]
             sy = struct.unpack_from("<H", payload, 4)[0]
             return f"TX {name} seq={seq} tilt={tilt:.1f} sy={sy}"
-        if type_id == CMD_GET_IMU or type_id == CMD_GET_INA:
+        if type_id == CMD_GET_IMU or type_id == CMD_GET_INA or type_id == CMD_GET_STATE:
             return f"TX {name} seq={seq}"
         if type_id == CMD_FEEDBACK_FLOW and len(payload) >= 1:
             return f"TX {name} seq={seq} on={payload[0]}"
@@ -236,6 +279,17 @@ def format_tx_for_log(seq: int, type_id: int, payload: bytes) -> str:
         if type_id == CMD_CALIBRATE and len(payload) >= 1:
             return f"TX {name} seq={seq} id={payload[0]}"
         if type_id in (CMD_ENTER_TRACKING, CMD_ENTER_CONFIG, CMD_EXIT_CONFIG):
+            return f"TX {name} seq={seq}"
+        # OTA commands
+        if type_id == CMD_OTA_START and len(payload) >= 5:
+            size = struct.unpack_from("<I", payload, 0)[0]
+            ht = payload[4]
+            return f"TX {name} seq={seq} size={size} hash_type={ht}"
+        if type_id == CMD_OTA_CHUNK and len(payload) >= 6:
+            off = struct.unpack_from("<I", payload, 0)[0]
+            ln = struct.unpack_from("<H", payload, 4)[0]
+            return f"TX {name} seq={seq} offset={off} len={ln}"
+        if type_id in (CMD_OTA_END, CMD_OTA_ABORT):
             return f"TX {name} seq={seq}"
     except (struct.error, IndexError):
         pass
@@ -264,6 +318,31 @@ def format_rx_for_log(seq: int, type_id: int, payload: bytes) -> str:
             ina = decode_ina(payload)
             if ina:
                 return f"RX INA seq={seq} bus_v={ina['bus_v']:.3f}V current_ma={ina['current_ma']:.2f} power_mw={ina['power_mw']:.1f}"
+        if type_id == 1013 and len(payload) >= 1:
+            s = payload[0]
+            names = {0: "idle", 1: "tracking", 2: "config"}
+            return f"RX STATE seq={seq} state={s} ({names.get(s, '?')})"
+        # OTA responses
+        if type_id == RSP_OTA_STARTED and len(payload) >= 5:
+            d = decode_ota_started(payload)
+            if d:
+                return f"RX OTA_STARTED seq={seq} slot={d['inactive_slot']} size={d['slot_size']}"
+        if type_id == RSP_OTA_CHUNK and len(payload) >= 5:
+            d = decode_ota_chunk_ack(payload)
+            if d:
+                return f"RX OTA_CHUNK_ACK seq={seq} written={d['bytes_written']} progress={d['progress_pct']}%"
+        if type_id == RSP_OTA_DONE and len(payload) >= 1:
+            d = decode_ota_done(payload)
+            if d:
+                return f"RX OTA_DONE seq={seq} status={d['status']}"
+        if type_id == RSP_OTA_NACK and len(payload) >= 1:
+            d = decode_ota_nack(payload)
+            if d:
+                return f"RX OTA_NACK seq={seq} error={d['error_code']} ({d['error_name']})"
+        if type_id == RSP_FW_INFO and len(payload) >= 65:
+            d = decode_fw_info(payload)
+            if d:
+                return f"RX FW_INFO seq={seq} active={d['active_slot']} A={d['version_a']!r} B={d['version_b']!r}"
     except (struct.error, IndexError, KeyError):
         pass
     return f"RX {name} seq={seq} len={len(payload)}"
@@ -281,3 +360,83 @@ def cmd_enter_tracking(seq: int) -> bytes:
 
 def cmd_get_imu(seq: int) -> bytes:
     return build_frame(seq, CMD_GET_IMU, b"")
+
+
+# ---------- OTA helpers ----------
+
+def cmd_ota_start(seq: int, total_size: int, hash_type: int = OTA_HASH_CRC32, expected_hash: bytes = b"") -> bytes:
+    """Build OTA_START frame. hash_type: 0=none, 1=CRC32, 2=SHA256."""
+    payload = struct.pack("<IB", total_size, hash_type) + expected_hash
+    return build_frame(seq, CMD_OTA_START, payload)
+
+
+def cmd_ota_chunk(seq: int, offset: int, data: bytes) -> bytes:
+    """Build OTA_CHUNK frame. data max ~2KB (limited by MAX_PAYLOAD - 6)."""
+    payload = struct.pack("<IH", offset, len(data)) + data
+    return build_frame(seq, CMD_OTA_CHUNK, payload)
+
+
+def cmd_ota_end(seq: int) -> bytes:
+    """Build OTA_END frame."""
+    return build_frame(seq, CMD_OTA_END, b"")
+
+
+def cmd_ota_abort(seq: int) -> bytes:
+    """Build OTA_ABORT frame."""
+    return build_frame(seq, CMD_OTA_ABORT, b"")
+
+
+def decode_ota_started(payload: bytes) -> Optional[dict]:
+    """Decode ACK_OTA_STARTED: inactive_slot(1), slot_size(4)."""
+    if len(payload) < 5:
+        return None
+    return {
+        "inactive_slot": payload[0],
+        "slot_size": struct.unpack_from("<I", payload, 1)[0],
+    }
+
+
+def decode_ota_chunk_ack(payload: bytes) -> Optional[dict]:
+    """Decode ACK_OTA_CHUNK: bytes_written(4), progress_pct(1)."""
+    if len(payload) < 5:
+        return None
+    return {
+        "bytes_written": struct.unpack_from("<I", payload, 0)[0],
+        "progress_pct": payload[4],
+    }
+
+
+def decode_ota_done(payload: bytes) -> Optional[dict]:
+    """Decode ACK_OTA_DONE: status(1). 0=OK."""
+    if len(payload) < 1:
+        return None
+    return {"status": payload[0]}
+
+
+def decode_ota_nack(payload: bytes) -> Optional[dict]:
+    """Decode NACK_OTA: error_code(1)."""
+    if len(payload) < 1:
+        return None
+    codes = {1: "SIZE_MISMATCH", 2: "CHECKSUM_FAIL", 3: "FLASH_ERROR", 4: "TIMEOUT", 5: "ABORTED"}
+    code = payload[0]
+    return {"error_code": code, "error_name": codes.get(code, "UNKNOWN")}
+
+
+def cmd_get_fw_info(seq: int) -> bytes:
+    """Build GET_FW_INFO frame."""
+    return build_frame(seq, CMD_GET_FW_INFO, b"")
+
+
+def cmd_switch_fw(seq: int, slot: int) -> bytes:
+    """Build SWITCH_FW frame. slot: 0=A (ota_0), 1=B (ota_1)."""
+    return build_frame(seq, CMD_SWITCH_FW, bytes([slot & 1]))
+
+
+def decode_fw_info(payload: bytes) -> Optional[dict]:
+    """Decode FW_INFO: active_slot(1), version_a(32), version_b(32)."""
+    if len(payload) < 1 + FW_VERSION_LEN * 2:
+        return None
+    active_slot = payload[0]
+    version_a = payload[1 : 1 + FW_VERSION_LEN].rstrip(b"\x00").decode("utf-8", errors="replace")
+    version_b = payload[1 + FW_VERSION_LEN : 1 + FW_VERSION_LEN * 2].rstrip(b"\x00").decode("utf-8", errors="replace")
+    return {"active_slot": active_slot, "version_a": version_a, "version_b": version_b}

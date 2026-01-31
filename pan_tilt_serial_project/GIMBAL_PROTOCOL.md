@@ -57,6 +57,23 @@ TYPE is 2 bytes little-endian. Commands from the current program:
 | 0x0089     | 137 | ENTER_TRACKING | optional: interval(2) ms. 0 bytes or 2 bytes. |
 | 0x008B     | 139 | ENTER_CONFIG | None. |
 | 0x008C     | 140 | EXIT_CONFIG | None. |
+| 0x0090     | 144 | GET_STATE | None. Query current gimbal state (IDLE/TRACKING/CONFIG). |
+
+### OTA Commands (UART firmware update)
+
+| TYPE (hex) | Dec | Name | Payload layout |
+|------------|-----|------|-----------------|
+| 0x0258     | 600 | OTA_START | total_size(4), hash_type(1), expected_hash(4 or 32). hash_type: 0=none, 1=CRC32 (4 bytes), 2=SHA256 (32 bytes). |
+| 0x0259     | 601 | OTA_CHUNK | offset(4), length(2), data(N). N ≤ 2048. Chunks sent sequentially. |
+| 0x025A     | 602 | OTA_END | None. Triggers checksum verification and conditional commit. |
+| 0x025B     | 603 | OTA_ABORT | None. Abort OTA; discard partial write; return to IDLE. |
+
+### FW Info Commands
+
+| TYPE (hex) | Dec | Name | Payload layout |
+|------------|-----|------|----------------|
+| 0x0262     | 610 | GET_FW_INFO | None. Returns active slot, versions for A and B. |
+| 0x0263     | 611 | SWITCH_FW | slot(1). slot: 0=boot A (ota_0), 1=boot B (ota_1). Reboots to apply. |
 
 Float: IEEE 754 single (4 bytes). All multi-byte fields little-endian.
 
@@ -73,6 +90,7 @@ Float: IEEE 754 single (4 bytes). All multi-byte fields little-endian.
 | 0x03F2     | 1010 | INA | bus_v(4), shunt_mv(4), load_v(4), current_ma(4), power_mw(4), overflow(1) = 21 bytes. |
 | 0x03F3     | 1011 | SERVO | pan: pos(2), load(2), tilt: pos(2), load(2) = 8 bytes. (Used if periodic servo feedback is ever added; move commands use ACK_EXECUTED with torque instead.) |
 | 0x03F4     | 1012 | HEARTBEAT_STATUS | alive(1), timeout_ms(2) = 3 bytes. |
+| 0x03F5     | 1013 | STATE | state(1) = 0 IDLE, 1 TRACKING, 2 CONFIG. Response to GET_STATE (144). |
 | 0x07D1     | 2001 | PING_RESP | id(1), responded(1), result(1), mode(1), torque_limit(2), torque_enable(1), position(2) = 9 bytes. |
 | 0x138A     | 5002 | SET_ID_OK | from(1), to(1) = 2 bytes. |
 | 0x138B     | 5003 | SET_ID_VERIFY | id(1), verified(1) = 2 bytes. |
@@ -82,6 +100,21 @@ Float: IEEE 754 single (4 bytes). All multi-byte fields little-endian.
 | 0x0849     | 2121 | READ_WORD_RESP | id(1), addr(1), value(2) = 4 bytes. |
 | 0x085B     | 2131 | WRITE_WORD_RESP | id(1), addr(1), ok(1) = 3 bytes. |
 | 0x139D     | 5021 | CALIBRATE_RESP | id(1), ok(1) = 2 bytes. |
+
+### OTA Responses
+
+| TYPE (hex) | Dec  | Name | Payload layout |
+|------------|------|------|----------------|
+| 0x0A28     | 2600 | ACK_OTA_STARTED | inactive_slot(1), slot_size(4). slot: 0=A, 1=B. |
+| 0x0A29     | 2601 | ACK_OTA_CHUNK | bytes_written(4), progress_pct(1). Cumulative bytes; 0–100%. |
+| 0x0A2A     | 2602 | ACK_OTA_DONE | status(1). 0=OK (committed, rebooting). |
+| 0x0A2B     | 2603 | NACK_OTA | error_code(1). 1=SIZE_MISMATCH, 2=CHECKSUM_FAIL, 3=FLASH_ERROR, 4=TIMEOUT, 5=ABORTED. |
+
+### FW Info Response
+
+| TYPE (hex) | Dec  | Name | Payload layout |
+|------------|------|------|----------------|
+| 0x0A32     | 2610 | FW_INFO | active_slot(1), version_a(32), version_b(32). active_slot: 0=A, 1=B. Version strings null-padded; "---" if partition empty/unreadable. |
 
 Unsolicited or async responses (e.g. IMU on request): SEQ can be 0 or the same as the request if the response is tied to a command.
 
@@ -123,7 +156,50 @@ If binary payload or future extension could contain 0x02 or 0x03, the protocol c
 
 ---
 
-## 7. Summary
+## 7. OTA (Over-The-Air Update) Flow
+
+UART OTA allows firmware updates over serial without manual bootloader mode.
+
+### 7.1 A/B Partition Scheme
+
+ESP32 flash has two app slots (A and B). OTA writes to the **inactive** slot; on success, commits and reboots into it.
+
+### 7.2 OTA Flow
+
+```
+Host                                      ESP32
+  │                                         │
+  │  OTA_START (size, hash_type, hash)      │
+  │────────────────────────────────────────►│  Begin write to inactive slot
+  │         ACK_OTA_STARTED (slot, size)    │
+  │◄────────────────────────────────────────│
+  │                                         │
+  │  OTA_CHUNK (offset, len, data) × N      │
+  │────────────────────────────────────────►│  Write chunks
+  │         ACK_OTA_CHUNK (written, %)      │
+  │◄────────────────────────────────────────│
+  │         ...                             │
+  │                                         │
+  │  OTA_END                                │
+  │────────────────────────────────────────►│  Verify checksum
+  │         ACK_OTA_DONE (0=OK)             │  If OK: commit, reboot
+  │◄────────────────────────────────────────│
+  │         or NACK_OTA (error)             │  If fail: no commit, stay on old slot
+```
+
+### 7.3 OTA Error Codes (NACK_OTA)
+
+| Code | Name | Description |
+|------|------|-------------|
+| 1 | SIZE_MISMATCH | Image larger than slot or size mismatch |
+| 2 | CHECKSUM_FAIL | Hash verification failed; **no commit** |
+| 3 | FLASH_ERROR | Write or erase error |
+| 4 | TIMEOUT | No chunk received within timeout |
+| 5 | ABORTED | OTA_ABORT received or internal abort |
+
+---
+
+## 8. Summary
 
 - **Option A**: Binary frame = `[STX][LEN][SEQ][TYPE][PAYLOAD][CHECKSUM][ETX]`.
 - **Checksum**: CRC8 over LEN through PAYLOAD (single byte, fast).
@@ -131,6 +207,7 @@ If binary payload or future extension could contain 0x02 or 0x03, the protocol c
 - **ACK_RECEIVED** (type 1): optional, after valid parse.
 - **ACK_EXECUTED** (type 2): after execution; for move commands feedback = **position and torque** for both axes, payload = 8 bytes (pan_load, pan_pos, tilt_load, tilt_pos).
 - **NACK** (type 3): code + optional message.
+- **OTA commands** (600–603): UART firmware update; commit only after checksum verification.
 - Half-duplex applies only to the **servo bus** (Serial1). **Position and torque** are read on that bus when a move is executed and returned in ACK_EXECUTED (8-byte payload). IMU is on I2C.
 
 This document defines the protocol only. Implementation (parser/serializer on ESP32 and host) follows this spec.

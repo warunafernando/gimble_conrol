@@ -212,6 +212,7 @@ Incoming frames are parsed in `serialCtrl()`; valid frames trigger `processComma
 - **Get INA (160):** `sendInaBinary(seq)` → type 1010, 21 bytes.
 - **Feedback (131, 142), Heartbeat (136):** Set globals, ACK_EXECUTED.
 - **Ping (200), Set ID (501), Read/Write byte/word (210–213), Calibrate (502):** Servo bus operations, type-specific responses (2001, 5002, 2101, etc.).
+- **Get state (144):** `sendFrame(seq, FEEDBACK_STATE, &stateByte, 1)` with stateByte = 0 (IDLE), 1 (TRACKING), or 2 (CONFIG). The host can query whether the ESP32 is in tracking mode (or IDLE/CONFIG) at any time.
 - **Unknown type:** NACK(2).
 
 ---

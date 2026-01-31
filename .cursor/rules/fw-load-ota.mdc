@@ -1,0 +1,34 @@
+---
+description: Use UART OTA for firmware loading when updating ESP32
+globs: pan_tilt_serial_project/**/*.ino,pan_tilt_serial_project/**/*.cpp
+alwaysApply: false
+---
+
+# Firmware Loading: Use UART OTA
+
+When changing ESP32 firmware and loading it to the device, **always use UART OTA** (not manual bootloader).
+
+## Default Load Method
+
+When running via Shell (to avoid timeout), run OTA in **background** (`is_background=true`).
+
+```bash
+# Preferred: double-click ota_load.bat (no timeout)
+tools\ota_load.bat COM9
+
+# Or: python OTA (run in background when using Shell)
+python tools/uart_ota.py -p COM9
+
+# OTA first, manual fallback if needed
+tools\load_new_fw.bat COM9
+```
+
+## Do NOT Use Manual Bootloader
+
+Unless OTA fails or the device has never had OTA firmware, do **not** use:
+- `waveshare_uploader.py --manual`
+- `esptool write_flash` directly
+
+## Fallback
+
+Use manual bootloader only when OTA fails (e.g., first-time flash). See `docs/UART_OTA_LOAD_GUIDE.md`.

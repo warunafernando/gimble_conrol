@@ -35,7 +35,15 @@ If the tool seems to hang during connection:
 
 ## Usage
 
-### Simple Upload
+### UART OTA (recommended – no bootloader needed)
+
+Double-click `ota_load.bat` or run:
+```bash
+python tools/uart_ota.py -p COM9
+```
+See `docs/UART_OTA_LOAD_GUIDE.md` for details. Use `ota_load.bat` when running from IDE to avoid timeout.
+
+### Manual Upload (bootloader required)
 ```bash
 python tools/waveshare_uploader.py -p COM9 --build-dir .pio/build/esp32dev
 ```
