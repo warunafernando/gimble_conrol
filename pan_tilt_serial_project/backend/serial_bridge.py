@@ -72,16 +72,31 @@ class SerialBridge:
             self.on_log(msg)
 
     def start(self) -> bool:
-        try:
-            self._serial = serial.Serial(self.port, self.baud, timeout=0.01)
-            self._log(f"Serial opened {self.port} @ {self.baud}")
-        except Exception as e:
-            self._log(f"Serial open failed: {e}")
-            return False
-        self._running = True
-        self._thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._thread.start()
-        return True
+        # On Windows, port can stay locked briefly after close; retry on PermissionError
+        for attempt in range(3):
+            try:
+                self._serial = serial.Serial(self.port, self.baud, timeout=0.01)
+                self._log(f"Serial opened {self.port} @ {self.baud}")
+                self._running = True
+                self._thread = threading.Thread(target=self._read_loop, daemon=True)
+                self._thread.start()
+                return True
+            except (OSError, PermissionError) as e:
+                err_str = str(e)
+                if "Access is denied" in err_str or "denied" in err_str.lower():
+                    if attempt < 2:
+                        self._log(f"Port busy, retry in 2s ({attempt + 1}/3)...")
+                        time.sleep(2)
+                    else:
+                        self._log(f"Serial open failed: {e}")
+                        return False
+                else:
+                    self._log(f"Serial open failed: {e}")
+                    return False
+            except Exception as e:
+                self._log(f"Serial open failed: {e}")
+                return False
+        return False
 
     def stop(self) -> None:
         self._running = False

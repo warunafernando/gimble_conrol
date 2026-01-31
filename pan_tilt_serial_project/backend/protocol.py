@@ -16,6 +16,7 @@ RSP_NACK = 3
 
 # Command types (host -> ESP32)
 CMD_GET_IMU = 126
+CMD_GET_IMU2 = 127  # ICM42688 second IMU
 CMD_PAN_TILT_ABS = 133
 CMD_PAN_TILT_MOVE = 134
 CMD_PAN_TILT_STOP = 135
@@ -51,6 +52,10 @@ CMD_OTA_ABORT = 603
 # FW Info Commands
 CMD_GET_FW_INFO = 610
 CMD_SWITCH_FW = 611
+
+# Debug Commands
+CMD_I2C_SCAN = 220
+RSP_I2C_SCAN = 2200
 
 # OTA Responses
 RSP_OTA_STARTED = 2600
@@ -157,9 +162,25 @@ def decode_imu(payload: bytes) -> Optional[dict]:
     }
 
 
+def decode_imu2(payload: bytes) -> Optional[dict]:
+    """Decode IMU2 (ICM42688) response: 28 bytes."""
+    if len(payload) < 28:
+        return None
+    return {
+        "ax": struct.unpack_from("<f", payload, 0)[0],
+        "ay": struct.unpack_from("<f", payload, 4)[0],
+        "az": struct.unpack_from("<f", payload, 8)[0],
+        "gx": struct.unpack_from("<f", payload, 12)[0],
+        "gy": struct.unpack_from("<f", payload, 16)[0],
+        "gz": struct.unpack_from("<f", payload, 20)[0],
+        "temp": struct.unpack_from("<f", payload, 24)[0],
+    }
+
+
 # Human-readable log helpers
 CMD_NAMES = {
     CMD_GET_IMU: "GET_IMU",
+    CMD_GET_IMU2: "GET_IMU2",
     CMD_PAN_TILT_ABS: "PAN_TILT_ABS",
     CMD_PAN_TILT_MOVE: "PAN_TILT_MOVE",
     CMD_PAN_TILT_STOP: "PAN_TILT_STOP",
@@ -189,12 +210,16 @@ CMD_NAMES = {
     CMD_OTA_CHUNK: "OTA_CHUNK",
     CMD_OTA_END: "OTA_END",
     CMD_OTA_ABORT: "OTA_ABORT",
+    CMD_I2C_SCAN: "I2C_SCAN",
+    CMD_GET_FW_INFO: "GET_FW_INFO",
+    CMD_SWITCH_FW: "SWITCH_FW",
 }
 RSP_NAMES = {
     RSP_ACK_RECEIVED: "ACK_RECEIVED",
     RSP_ACK_EXECUTED: "ACK_EXECUTED",
     RSP_NACK: "NACK",
     1002: "IMU",
+    1003: "IMU2",
     1010: "INA",
     1011: "SERVO",
     1012: "HEARTBEAT_STATUS",
@@ -213,6 +238,7 @@ RSP_NAMES = {
     RSP_OTA_DONE: "OTA_DONE",
     RSP_OTA_NACK: "OTA_NACK",
     RSP_FW_INFO: "FW_INFO",
+    RSP_I2C_SCAN: "I2C_SCAN_RESULT",
 }
 
 
@@ -314,6 +340,10 @@ def format_rx_for_log(seq: int, type_id: int, payload: bytes) -> str:
             imu = decode_imu(payload)
             if imu:
                 return f"RX IMU seq={seq} roll={imu['roll']:.2f} pitch={imu['pitch']:.2f} yaw={imu['yaw']:.2f}"
+        if type_id == 1003 and len(payload) >= 28:
+            imu2 = decode_imu2(payload)
+            if imu2:
+                return f"RX IMU2 seq={seq} ax={imu2['ax']:.3f} ay={imu2['ay']:.3f} az={imu2['az']:.3f} gx={imu2['gx']:.1f} gy={imu2['gy']:.1f} gz={imu2['gz']:.1f}"
         if type_id == 1010 and len(payload) >= 21:
             ina = decode_ina(payload)
             if ina:
@@ -343,6 +373,10 @@ def format_rx_for_log(seq: int, type_id: int, payload: bytes) -> str:
             d = decode_fw_info(payload)
             if d:
                 return f"RX FW_INFO seq={seq} active={d['active_slot']} A={d['version_a']!r} B={d['version_b']!r}"
+        if type_id == RSP_I2C_SCAN and len(payload) >= 1:
+            d = decode_i2c_scan(payload)
+            if d:
+                return f"RX I2C_SCAN seq={seq} count={d['count']} addresses={d['hex_addresses']}"
     except (struct.error, IndexError, KeyError):
         pass
     return f"RX {name} seq={seq} len={len(payload)}"
@@ -440,3 +474,50 @@ def decode_fw_info(payload: bytes) -> Optional[dict]:
     version_a = payload[1 : 1 + FW_VERSION_LEN].rstrip(b"\x00").decode("utf-8", errors="replace")
     version_b = payload[1 + FW_VERSION_LEN : 1 + FW_VERSION_LEN * 2].rstrip(b"\x00").decode("utf-8", errors="replace")
     return {"active_slot": active_slot, "version_a": version_a, "version_b": version_b}
+
+
+# I2C Scan
+def cmd_i2c_scan(seq: int) -> bytes:
+    """Build I2C_SCAN frame."""
+    return build_frame(seq, CMD_I2C_SCAN, b"")
+
+
+# Known WHO_AM_I values for device identification
+WHO_AM_I_NAMES = {
+    0x47: "ICM42688",
+    0x42: "ICM42688-V / INA219",
+    0x6F: "ICM42605",
+    0xEA: "ICM20948",
+    0x05: "QMI8658",
+    0x00: "AK09918",
+}
+
+
+def decode_i2c_scan(payload: bytes) -> Optional[dict]:
+    """Decode I2C_SCAN response: count(1), addresses(count), who75[4], who00[4]."""
+    if len(payload) < 1:
+        return None
+    count = payload[0]
+    addresses = list(payload[1:1 + count]) if count > 0 else []
+    hex_addresses = [f"0x{addr:02X}" for addr in addresses]
+    result = {"count": count, "addresses": addresses, "hex_addresses": hex_addresses}
+
+    # Parse WHO_AM_I for 0x68, 0x69, 0x6A, 0x6B if present
+    imu_addrs = [0x68, 0x69, 0x6A, 0x6B]
+    if len(payload) >= 9 + count:
+        who75 = list(payload[1 + count : 5 + count])
+        who00 = list(payload[5 + count : 9 + count])
+        device_ids = {}
+        for i, addr in enumerate(imu_addrs):
+            w75 = who75[i] if i < len(who75) else 0xFF
+            w00 = who00[i] if i < len(who00) else 0xFF
+            name75 = WHO_AM_I_NAMES.get(w75, None)
+            name00 = WHO_AM_I_NAMES.get(w00, None)
+            device_ids[f"0x{addr:02X}"] = {
+                "who75": w75,
+                "who00": w00,
+                "name75": name75,
+                "name00": name00,
+            }
+        result["device_ids"] = device_ids
+    return result

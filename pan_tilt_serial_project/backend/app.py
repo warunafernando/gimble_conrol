@@ -13,10 +13,14 @@ from typing import Optional
 from serial_bridge import DebugLog, SerialBridge
 from protocol import (
     CMD_GET_FW_INFO,
+    CMD_I2C_SCAN,
     RSP_ACK_EXECUTED,
     RSP_FW_INFO,
+    RSP_I2C_SCAN,
     decode_fw_info,
+    decode_i2c_scan,
     decode_imu,
+    decode_imu2,
     decode_ina,
     decode_move_feedback,
 )
@@ -28,7 +32,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 debug_log = DebugLog(max_lines=500)
 bridge: Optional[SerialBridge] = None
 _seq = 0
-_state = {"connected": False, "port": "", "last_move": None, "last_imu": None, "last_ina": None, "last_gimbal_state": None, "fw_info": None}
+_state = {"connected": False, "port": "", "last_move": None, "last_imu": None, "last_imu2": None, "last_ina": None, "last_gimbal_state": None, "fw_info": None}
 
 
 def next_seq() -> int:
@@ -49,6 +53,13 @@ def on_frame(seq: int, type_id: int, payload: bytes) -> None:
         if imu:
             _state["last_imu"] = imu
             data["payload"] = imu
+    elif type_id == 1003 and len(payload) >= 28:
+        imu2 = decode_imu2(payload)
+        if imu2:
+            _state["last_imu2"] = imu2
+            data["payload"] = imu2
+            with app.app_context():
+                socketio.emit("imu2", imu2)
     elif type_id == 1010:
         if len(payload) >= 21:
             try:
@@ -75,6 +86,12 @@ def on_frame(seq: int, type_id: int, payload: bytes) -> None:
             data["payload"] = fw
             with app.app_context():
                 socketio.emit("fw_info", fw)
+    elif type_id == RSP_I2C_SCAN:
+        i2c = decode_i2c_scan(payload)
+        if i2c:
+            data["payload"] = i2c
+            with app.app_context():
+                socketio.emit("i2c_scan", i2c)
     with app.app_context():
         socketio.emit("frame", data)
 

@@ -154,6 +154,13 @@
       <pre class="live" id="liveImu">—</pre>
     </div>
     <div class="panel">
+      <h2>IMU2 - ICM42688</h2>
+      <div class="btn-row" style="margin-bottom:6px">
+        <button id="cmdGetImu2">Get IMU2 (127)</button>
+      </div>
+      <pre class="live" id="liveImu2">—</pre>
+    </div>
+    <div class="panel">
       <h2>INA (last)</h2>
       <div class="btn-row" style="margin-bottom:6px">
         <button id="cmdGetIna">Get INA (160)</button>
@@ -278,6 +285,14 @@
         <button id="cmdUserCtrl">Send</button>
       </div>
     </div>
+    <div class="panel" style="min-width: 220px;">
+      <h2>Debug - I2C Scan</h2>
+      <button id="cmdI2cScan">Scan I2C Bus (220)</button>
+      <div id="i2cResult" style="margin-top:8px; font-family: 'Consolas', monospace; font-size: 0.8rem;">
+        <span class="k">Devices:</span> <span id="i2cCount">—</span><br>
+        <div id="i2cAddresses" style="margin-top:4px; color: #a8e6cf;"></div>
+      </div>
+    </div>
   </div>
 
   <div class="row" style="margin-top:12px">
@@ -335,6 +350,34 @@
     socket.on('fw_info', function (fw) {
       updateFwDisplay(fw || {});
     });
+    socket.on('i2c_scan', function (data) {
+      document.getElementById('i2cCount').textContent = data.count || 0;
+      const addrDiv = document.getElementById('i2cAddresses');
+      const deviceIds = data.device_ids || {};
+      if (data.hex_addresses && data.hex_addresses.length > 0) {
+        addrDiv.innerHTML = data.hex_addresses.map(function(addr) {
+          var dev = deviceIds[addr];
+          var label = addr;
+          if (dev && (dev.who75 !== 255 || dev.who00 !== 255)) {
+            var n = dev.name75 || dev.name00 || '';
+            if (!n) n = 'WHO75=' + (dev.who75 !== 255 ? '0x' + dev.who75.toString(16).toUpperCase() : '?') +
+                         ' WHO00=' + (dev.who00 !== 255 ? '0x' + dev.who00.toString(16).toUpperCase() : '?');
+            label = addr + ' (' + n + ')';
+          }
+          return '<span style="display:inline-block;margin:2px 4px;padding:2px 6px;background:#25252d;border-radius:4px;" title="' + addr + '">' + label + '</span>';
+        }).join('');
+      } else {
+        addrDiv.innerHTML = '<span style="color:#888;">No devices found</span>';
+      }
+    });
+    socket.on('imu2', function (data) {
+      const el = document.getElementById('liveImu2');
+      if (el && data) {
+        el.innerHTML = '<span class="k">Accel:</span> <span class="v">' + (data.ax || 0).toFixed(3) + '</span> <span class="v">' + (data.ay || 0).toFixed(3) + '</span> <span class="v">' + (data.az || 0).toFixed(3) + '</span> g\n' +
+                       '<span class="k">Gyro:</span> <span class="v">' + (data.gx || 0).toFixed(1) + '</span> <span class="v">' + (data.gy || 0).toFixed(1) + '</span> <span class="v">' + (data.gz || 0).toFixed(1) + '</span> °/s\n' +
+                       '<span class="k">Temp:</span> <span class="v">' + (data.temp || 0).toFixed(1) + '</span> °C';
+      }
+    });
     socket.on('frame', function (data) {
       if (data.payload) {
         if (data.type === 2 && data.payload.pan_pos !== undefined) {
@@ -343,6 +386,14 @@
         } else if (data.type === 1002) {
           const i = data.payload;
           liveImu.textContent = `r ${(i.roll||0).toFixed(2)}  p ${(i.pitch||0).toFixed(2)}  y ${(i.yaw||0).toFixed(2)}`;
+        } else if (data.type === 1003) {
+          const i = data.payload;
+          const el = document.getElementById('liveImu2');
+          if (el && i) {
+            el.innerHTML = '<span class="k">Accel:</span> <span class="v">' + (i.ax || 0).toFixed(3) + '</span> <span class="v">' + (i.ay || 0).toFixed(3) + '</span> <span class="v">' + (i.az || 0).toFixed(3) + '</span> g\n' +
+                           '<span class="k">Gyro:</span> <span class="v">' + (i.gx || 0).toFixed(1) + '</span> <span class="v">' + (i.gy || 0).toFixed(1) + '</span> <span class="v">' + (i.gz || 0).toFixed(1) + '</span> °/s\n' +
+                           '<span class="k">Temp:</span> <span class="v">' + (i.temp || 0).toFixed(1) + '</span> °C';
+          }
         } else if (data.type === 1010) {
           const a = data.payload || {};
           if (a.error) {
@@ -538,10 +589,23 @@
       sendCommand(141, [i8ToByte(x), i8ToByte(y)].concat(u16ToBytes(spd)));
     };
 
-    // Query
-    document.getElementById('cmdGetImu').onclick = function () { sendCommand(126, []); };
-    document.getElementById('cmdGetIna').onclick = function () { sendCommand(160, []); };
-    document.getElementById('cmdGetFwInfo').onclick = function () { sendCommand(610, []); };
+    // Query - with debounce to prevent rapid-fire clicks
+    let lastCmdTime = {};
+    function throttledCommand(cmd, payload, minInterval = 200) {
+      const now = Date.now();
+      if (lastCmdTime[cmd] && (now - lastCmdTime[cmd]) < minInterval) {
+        console.log(`Throttled command ${cmd} (too fast)`);
+        return;
+      }
+      lastCmdTime[cmd] = now;
+      sendCommand(cmd, payload);
+    }
+    
+    document.getElementById('cmdGetImu').onclick = function () { throttledCommand(126, [], 200); };
+    document.getElementById('cmdGetImu2').onclick = function () { throttledCommand(127, [], 200); };
+    document.getElementById('cmdGetIna').onclick = function () { throttledCommand(160, [], 200); };
+    document.getElementById('cmdGetFwInfo').onclick = function () { throttledCommand(610, [], 500); };
+    document.getElementById('cmdI2cScan').onclick = function () { throttledCommand(220, [], 500); };
 
     // Config / diagnostics
     document.getElementById('cmdPing').onclick = function () {

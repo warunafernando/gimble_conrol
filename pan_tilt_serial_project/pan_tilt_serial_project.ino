@@ -3,6 +3,7 @@
 #include <SCServo.h>
 #include <INA219_WE.h>
 #include "IMU.h"
+// #include "ICM42688.h"  // Disabled for now
 
 // OTA includes
 #include <esp_ota_ops.h>
@@ -53,6 +54,7 @@ static const int CMD_PAN_ONLY_MOVE = 174;
 static const int CMD_TILT_ONLY_MOVE = 175;
 
 static const int CMD_GET_IMU = 126;
+static const int CMD_GET_IMU2 = 127;  // ICM42688 second IMU
 static const int CMD_GET_INA = 160;
 static const int CMD_FEEDBACK_FLOW = 131;
 static const int CMD_FEEDBACK_INTERVAL = 142;
@@ -66,6 +68,7 @@ static const int CMD_WRITE_WORD = 213;  // {"T":213,"id":1,"addr":48,"value":100
 static const int CMD_CALIBRATE = 502;   // {"T":502,"id":1} set current pos as middle
 
 static const int FEEDBACK_IMU = 1002;
+static const int FEEDBACK_IMU2 = 1003;  // ICM42688 second IMU
 static const int FEEDBACK_INA = 1010;
 static const int FEEDBACK_SERVO = 1011;
 static const int FEEDBACK_HEARTBEAT = 1012;
@@ -97,6 +100,10 @@ static const uint16_t CMD_OTA_ABORT = 603;
 // FW info commands
 static const uint16_t CMD_GET_FW_INFO = 610;
 static const uint16_t CMD_SWITCH_FW = 611;
+
+// Debug commands
+static const uint16_t CMD_I2C_SCAN = 220;
+static const uint16_t RSP_I2C_SCAN = 2200;
 
 // OTA responses
 static const uint16_t RSP_OTA_STARTED = 2600;
@@ -172,6 +179,10 @@ IMU_ST_SENSOR_DATA_FLOAT imuGyro{};
 IMU_ST_SENSOR_DATA_FLOAT imuAccel{};
 IMU_ST_SENSOR_DATA imuMagn{};
 float imuTemp = 0.0f;
+
+// ICM42688 second IMU - DISABLED
+// ICM42688 icm42688(ICM42688_ADDR_HIGH);  // 0x69
+// bool icm42688_ok = false;
 
 float panTargetDeg = 0.0f;
 float tiltTargetDeg = 0.0f;
@@ -649,6 +660,13 @@ static void sendImuBinary(uint16_t seq) {
   sendFrame(seq, FEEDBACK_IMU, buf, 50);
 }
 
+// Binary IMU2 response (ICM42688): 28 bytes - DISABLED
+// ax(4), ay(4), az(4), gx(4), gy(4), gz(4), temp(4)
+static void sendImu2Binary(uint16_t seq) {
+  // ICM42688 disabled
+  sendNack(seq, 4);  // exec_failed
+}
+
 // Binary INA response: 21 bytes
 static void sendInaBinary(uint16_t seq) {
   updateIna219();
@@ -865,10 +883,15 @@ static void handleOtaChunk(uint16_t seq, const uint8_t* payload, size_t payloadL
 
 static void handleOtaEnd(uint16_t seq) {
   // Finalize OTA
+  Serial.print("[OTA] Calling esp_ota_end, bytes written: ");
+  Serial.println(otaBytesWritten);
   esp_err_t err = esp_ota_end(otaHandle);
+  Serial.print("[OTA] esp_ota_end returned: 0x");
+  Serial.println(err, HEX);
   otaHandle = 0;
   
   if (err != ESP_OK) {
+    Serial.println("[OTA] ERROR: esp_ota_end failed");
     sendOtaNack(seq, OTA_ERR_FLASH_ERROR);
     otaAbortCleanup();
     return;
@@ -1011,6 +1034,56 @@ static void handleSwitchFw(uint16_t seq, const uint8_t* payload, size_t payloadL
   esp_restart();
 }
 
+// Read WHO_AM_I at reg (0x75 or 0x00) for addr; return 0xFF on failure
+static uint8_t readWhoAmI(uint8_t addr, uint8_t reg) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return 0xFF;
+  if (Wire.requestFrom(addr, (uint8_t)1) != 1) return 0xFF;
+  return Wire.read();
+}
+
+// ----------------------------- I2C Scan Handler -----------------------------
+static void handleI2cScan(uint16_t seq) {
+  uint8_t foundAddresses[128];
+  uint8_t count = 0;
+  uint8_t who75[4] = {0xFF, 0xFF, 0xFF, 0xFF};  // for 0x68,0x69,0x6A,0x6B
+  uint8_t who00[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+  
+  for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+    Wire.beginTransmission(addr);
+    uint8_t error = Wire.endTransmission();
+    
+    if (error == 0) {
+      if (count < 127) foundAddresses[count++] = addr;
+      
+      // Read WHO_AM_I for IMU addresses - include in payload so GUI can show device ID
+      if (addr == 0x68) {
+        who75[0] = readWhoAmI(addr, 0x75);
+        who00[0] = readWhoAmI(addr, 0x00);
+      } else if (addr == 0x69) {
+        who75[1] = readWhoAmI(addr, 0x75);
+        who00[1] = readWhoAmI(addr, 0x00);
+      } else if (addr == 0x6A) {
+        who75[2] = readWhoAmI(addr, 0x75);
+        who00[2] = readWhoAmI(addr, 0x00);
+      } else if (addr == 0x6B) {
+        who75[3] = readWhoAmI(addr, 0x75);
+        who00[3] = readWhoAmI(addr, 0x00);
+      }
+    }
+  }
+  
+  // Response: count(1) + addresses(count) + who75[4] + who00[4]
+  uint8_t payload[140];
+  payload[0] = count;
+  memcpy(&payload[1], foundAddresses, count);
+  memcpy(&payload[1 + count], who75, 4);
+  memcpy(&payload[5 + count], who00, 4);
+  
+  sendFrame(seq, RSP_I2C_SCAN, payload, 9 + count);  // count(1)+addrs(count)+who75[4]+who00[4]
+}
+
 static void processCommand(uint16_t seq, uint16_t type, const uint8_t* payload, size_t payloadLen) {
   // In OTA_RECEIVE state, only accept OTA commands
   if (gimbalState == OTA_RECEIVE && !isOtaType(type)) {
@@ -1057,6 +1130,10 @@ static void processCommand(uint16_t seq, uint16_t type, const uint8_t* payload, 
     case CMD_SWITCH_FW:
       if (gimbalState == OTA_RECEIVE) { sendNack(seq, 3); return; }
       handleSwitchFw(seq, payload, payloadLen);
+      return;
+    case CMD_I2C_SCAN:
+      if (gimbalState == OTA_RECEIVE) { sendNack(seq, 3); return; }
+      handleI2cScan(seq);
       return;
     case CMD_ENTER_TRACKING:
       gimbalState = TRACKING;
@@ -1193,6 +1270,9 @@ static void processCommand(uint16_t seq, uint16_t type, const uint8_t* payload, 
     } break;
     case CMD_GET_IMU:
       sendImuBinary(seq);
+      break;
+    case CMD_GET_IMU2:
+      sendImu2Binary(seq);
       break;
     case CMD_GET_INA:
       sendInaBinary(seq);
@@ -1355,6 +1435,7 @@ void IRAM_ATTR onControlTimer() {
 void setup() {
   Serial.begin(SERIAL_BAUD);
   Wire.begin(S_SDA, S_SCL);
+  Wire.setClock(400000);  // Set I2C to 400kHz (ICM42688 supports up to 1MHz)
 
   Serial1.begin(SERVO_BAUD, SERIAL_8N1, SERVO_RXD, SERVO_TXD);
   st.pSerial = &Serial1;
@@ -1394,6 +1475,9 @@ void setup() {
   timerAttachInterrupt(controlTimer, &onControlTimer, true);
   timerAlarmWrite(controlTimer, 10000, true);
   timerAlarmEnable(controlTimer);
+
+  // ICM42688 disabled
+  Serial.println("\n[ICM42688] Disabled");
 }
 
 void loop() {
