@@ -1,89 +1,105 @@
-# Tools + quick setup (PC) for Waveshare 2‑Axis Pan‑Tilt Camera Module
+# Pan-Tilt Controller (ESP32 + ST3215 Servos)
 
-This hardware uses **Waveshare “General Driver for Robots” (ESP32 + CP2102 USB‑UART)** and **ST3215 serial bus servos** (not standard PWM hobby servos). You can control it from your computer in two common ways:
+Custom firmware and tools for the **Waveshare 2-Axis Pan-Tilt Camera Module** using **ESP32** and **ST3215 serial bus servos**.
 
-- **WiFi Web UI (recommended for first-time calibration)**: connect to the device hotspot and open `192.168.4.1`.
-- **USB Serial (good for scripting)**: send the same JSON commands over the ESP32 USB COM port.
+## Project Structure
 
-## What to install on this computer (Windows)
-
-- **Google Chrome** (for the built-in Web UI).
-- **CP2102 driver** (only if the COM port doesn’t appear):
-  - Download from Waveshare: `https://files.waveshare.com/upload/d/d6/CP210x_USB_TO_UART.zip`
-- **Python 3** (for USB control script in this folder).
-  - Install from Microsoft Store or `python.org`, then enable “Add python to PATH”.
-- **Arduino IDE (optional, only if you want to reprogram the ESP32)**:
-  - Arduino IDE download: `https://www.arduino.cc/en/software`
-  - Board package: install **ESP32** boards (Espressif) in Arduino IDE (Boards Manager).
-
-## Hardware connection checklist
-
-- **Use the correct USB Type‑C port** on the driver board:
-  - The “USB” Type‑C is the ESP32 programming/serial port (CP2102).
-- **Power**:
-  - Use the provided **12V 5A** supply into the XH2.54 power port.
-  - Start with the power switch **OFF**, connect USB, then turn power **ON**.
-
-## First-time servo calibration (Waveshare official method)
-
-Follow the Waveshare guide here: `https://www.waveshare.com/wiki/2-Axis_Pan-Tilt_Camera_Module_Assembly_and_Configuration_Guide`
-
-Key points:
-
-- On the OLED, you should see **“PT CAM Version:0.9”** on boot.
-- Connect your PC/phone to WiFi **`PT`** password **`12345678`**.
-- Open **`http://192.168.4.1`** in Chrome.
-- Set IDs (pan should be ID 2, tilt remains ID 1):
-  - `{"T":501,"raw":1,"new":2}`
-- Disable torque before centering by hand:
-  - `{"T":210,"cmd":0}`
-- Set middle position (run once for each servo id):
-  - `{"T":502,"id":1}` then `{"T":502,"id":2}`
-- Center command:
-  - `{"T":133,"X":0,"Y":0,"SPD":0,"ACC":0}`
-
-## USB control from this PC (Python)
-
-This repo includes a small script to send Waveshare JSON commands over the USB COM port.
-
-### Install Python deps
-
-```bash
-python -m pip install -r requirements.txt
+```
+Arduino_Controller/
+├── pan_tilt_serial_project/     # Main firmware and tools
+│   ├── *.ino, *.cpp, *.h        # ESP32 firmware (PlatformIO)
+│   ├── backend/                  # Python Web GUI backend
+│   │   ├── app.py               # Flask-SocketIO server
+│   │   ├── protocol.py          # Binary protocol encoder/decoder
+│   │   └── static/index.html    # Web GUI frontend
+│   ├── tools/                    # Utilities
+│   │   ├── uart_ota.py          # OTA firmware upload tool
+│   │   ├── pan_tilt_test_gui.py # Desktop test GUI
+│   │   └── waveshare_uploader.py# Initial flash tool
+│   └── docs/                     # Documentation
+│       ├── NEW_PANTILT_DEVICE_GUIDE.md  # Factory setup guide
+│       ├── UART_OTA_BUILD_GUIDE.md      # OTA build guide
+│       └── UART_OTA_LOAD_GUIDE.md       # OTA load guide
+├── SERIAL_PAN_TILT_SPEC.md      # Protocol specification
+├── ST3215_MEMORY_REGISTER_MAP.md # Servo register reference
+└── ST3215 memory register map-EN.xls
 ```
 
-### Find the COM port
+## Features
 
-Open **Device Manager → Ports (COM & LPT)**. You should see something like **“Silicon Labs CP210x USB to UART Bridge (COMxx)”**.
+- **Custom Binary Protocol** over UART (921600 baud) with CRC8 checksums
+- **OTA Firmware Updates** via serial (no bootloader button required after initial flash)
+- **A/B Image Scheme** for safe firmware updates with rollback capability
+- **Web GUI** for real-time control and monitoring
+- **IMU Integration** (QMI8658C accelerometer/gyroscope + AK09918C magnetometer)
+- **Power Monitoring** (INA219)
+- **ST3215 Servo Control** with position/torque feedback
 
-### Send commands
+## Quick Start
 
-Examples:
+### 1. Initial Setup (New Device)
 
+See `pan_tilt_serial_project/docs/NEW_PANTILT_DEVICE_GUIDE.md` for complete factory-to-production setup.
+
+### 2. Flash Firmware
+
+**First time** (requires manual boot mode):
 ```bash
-# Center the gimbal
-python pc_control.py --port COM7 --center
-
-# Set absolute angles (X: -180..180, Y: -30..90)
-python pc_control.py --port COM7 --set --x 45 --y 10
-
-# Raw JSON (advanced)
-python pc_control.py --port COM7 --json "{\"T\":133,\"X\":0,\"Y\":0,\"SPD\":0,\"ACC\":0}"
+cd pan_tilt_serial_project/tools
+pip install -r requirements.txt
+python waveshare_uploader.py --port COM9
 ```
 
-## References (official)
+**Subsequent updates** (OTA - recommended):
+```bash
+python uart_ota.py --port COM9 --firmware ../.pio/build/esp32s3_ota/firmware.bin
+```
 
-- `https://www.waveshare.com/wiki/2-Axis_Pan-Tilt_Camera_Module`
-- `https://www.waveshare.com/wiki/General_Driver_for_Robots`
-- Product page: `https://www.waveshare.com/general-driver-for-robots.htm`
+### 3. Run Web GUI
 
-## Firmware update (ESP32 on the driver board)
+```bash
+cd pan_tilt_serial_project/backend
+pip install -r requirements.txt
+python app.py
+```
 
-If you want to **update/reflash the ESP32 firmware** on the Waveshare **General Driver for Robots**, see:
+Open `http://localhost:5000` in browser.
 
-- `FIRMWARE_UPDATE.md`
+## Hardware
 
-This repo includes:
+- **Board**: Waveshare General Driver for Robots (ESP32-S3)
+- **Servos**: ST3215 serial bus servos (1 Mbps half-duplex TTL)
+- **IMU**: QMI8658C + AK09918C (I2C)
+- **Power**: INA219 monitor (I2C)
+- **USB**: CP2102 USB-UART bridge
 
-- `setup_windows_firmware.ps1` (installs Python flashing tools)
-- `flash_firmware.py` (wrapper around `esptool`)
+### Connections
+
+| Component | Interface | Notes |
+|-----------|-----------|-------|
+| Servos    | UART1 (GPIO17/18) | 1 Mbps half-duplex |
+| IMU       | I2C (GPIO11/12) | QMI8658C + AK09918C |
+| INA219    | I2C (GPIO11/12) | Power monitor |
+| Host PC   | UART0 (USB) | 921600 baud |
+
+## Protocol Overview
+
+Binary frame format:
+```
+[STX] [LEN_L] [LEN_H] [SEQ_L] [SEQ_H] [TYPE_L] [TYPE_H] [PAYLOAD...] [CRC8] [ETX]
+```
+
+Key commands:
+- `100` - Move (pan/tilt angles)
+- `200` - Get IMU data
+- `300` - Get power data
+- `500/501` - OTA start/chunk
+- `610/611` - Get FW info / Switch FW slot
+
+See `SERIAL_PAN_TILT_SPEC.md` for full protocol specification.
+
+## References
+
+- [Waveshare 2-Axis Pan-Tilt Camera Module](https://www.waveshare.com/wiki/2-Axis_Pan-Tilt_Camera_Module)
+- [Waveshare General Driver for Robots](https://www.waveshare.com/wiki/General_Driver_for_Robots)
+- [ST3215 Servo Datasheet](https://www.waveshare.com/wiki/ST3215_Servo)
