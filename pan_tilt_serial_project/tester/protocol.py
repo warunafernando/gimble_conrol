@@ -40,6 +40,19 @@ CMD_CALIBRATE = 502
 CMD_ENTER_TRACKING = 137
 CMD_ENTER_CONFIG = 139
 CMD_EXIT_CONFIG = 140
+CMD_GET_STATE = 144
+CMD_RESET_SAFETY = 145
+CMD_GET_SAFETY_STATUS = 146
+
+# Safety response types
+RSP_SAFETY_ALERT = 3000
+FEEDBACK_SAFETY_STATUS = 1014
+
+# Safety error codes
+SAFETY_ERR_STALL = 10
+SAFETY_ERR_OVERCURRENT = 11
+SAFETY_ERR_MODE_CORRUPTION = 12
+SAFETY_ERR_THERMAL = 13
 
 
 def crc8(data: bytes) -> int:
@@ -109,4 +122,41 @@ def decode_imu(payload: bytes) -> Optional[dict]:
         "my": struct.unpack_from("<h", payload, 38)[0],
         "mz": struct.unpack_from("<h", payload, 40)[0],
         "temp": struct.unpack_from("<f", payload, 46)[0],
+    }
+
+
+def decode_safety_status(payload: bytes) -> Optional[dict]:
+    """Decode safety status response (FEEDBACK_SAFETY_STATUS = 1014).
+
+    Payload format (5 bytes):
+    - triggered (1 byte): 1 if safety stop active, 0 otherwise
+    - reason (1 byte): Safety error code (see SAFETY_ERR_* constants)
+    - pan_stall (1 byte): 1 if pan servo in stall, 0 otherwise
+    - tilt_stall (1 byte): 1 if tilt servo in stall, 0 otherwise
+    - thermal_throttle (1 byte): 1 if thermal throttling active, 0 otherwise
+    """
+    if len(payload) < 5:
+        return None
+    return {
+        "triggered": payload[0] == 1,
+        "reason": payload[1],
+        "pan_stall": payload[2] == 1,
+        "tilt_stall": payload[3] == 1,
+        "thermal_throttle": payload[4] == 1,
+    }
+
+
+def decode_state(payload: bytes) -> Optional[dict]:
+    """Decode gimbal state response (RSP_STATE = 1013).
+
+    Payload format (1 byte):
+    - state (1 byte): 0=IDLE, 1=TRACKING, 2=CONFIG, 3=OTA_RECEIVE
+    """
+    if len(payload) < 1:
+        return None
+    state_names = {0: "IDLE", 1: "TRACKING", 2: "CONFIG", 3: "OTA_RECEIVE"}
+    state_val = payload[0]
+    return {
+        "state": state_val,
+        "state_name": state_names.get(state_val, "UNKNOWN"),
     }
