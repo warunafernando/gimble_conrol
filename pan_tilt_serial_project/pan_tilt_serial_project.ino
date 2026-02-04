@@ -39,6 +39,27 @@ static const uint32_t DEFAULT_FEEDBACK_MS = 100;
 static const uint32_t DEFAULT_HEARTBEAT_MS = 0;  // 0 = disabled (full servo test mode)
 static const uint32_t DEFAULT_IDLE_LOCK_MS = 500;
 
+// ----------------------------- Safety Configuration -----------------------------
+// Stall detection: load threshold and time before emergency stop
+static const int16_t STALL_LOAD_THRESHOLD = 900;      // Load units (max ~1000)
+static const uint32_t STALL_TIME_THRESHOLD_MS = 500;  // Time at high load before stop
+static const uint32_t STALL_CHECK_INTERVAL_MS = 50;   // How often to check for stall
+
+// Current limit: maximum allowed bus current (mA)
+static const float MAX_BUS_CURRENT_MA = 3000.0f;      // 3A limit
+
+// Servo mode verification interval
+static const uint32_t MODE_CHECK_INTERVAL_MS = 1000;  // Check every 1 second
+
+// Temperature limits (Celsius)
+static const float SERVO_TEMP_WARNING = 55.0f;
+static const float SERVO_TEMP_CRITICAL = 65.0f;
+
+// Speed/acceleration limits
+static const uint16_t MAX_SERVO_SPEED = 4000;     // Maximum allowed speed
+static const uint16_t MAX_SERVO_ACCEL = 254;      // Maximum allowed acceleration
+static const uint16_t THERMAL_THROTTLE_SPEED = 1500;  // Reduced speed when thermal throttling
+
 // ----------------------------- Protocol -----------------------------
 static const int CMD_PAN_TILT_ABS = 133;
 static const int CMD_PAN_TILT_MOVE = 134;
@@ -81,6 +102,8 @@ static const uint16_t CMD_ENTER_TRACKING = 137;
 static const uint16_t CMD_ENTER_CONFIG = 139;
 static const uint16_t CMD_EXIT_CONFIG = 140;
 static const uint16_t CMD_GET_STATE = 144;
+static const uint16_t CMD_RESET_SAFETY = 145;  // Reset safety stop state
+static const uint16_t CMD_GET_SAFETY_STATUS = 146;  // Get safety status
 
 // FW version: from build flag or default
 #ifndef APP_VERSION
@@ -198,6 +221,17 @@ static uint16_t lastPanPosTracking = SERVO_CENTER;
 static uint16_t lastTiltPosTracking = SERVO_CENTER;
 static hw_timer_t* controlTimer = nullptr;
 
+// ----------------------------- Safety State -----------------------------
+static bool safetyStopTriggered = false;
+static uint8_t safetyStopReason = 0;
+static uint32_t lastStallCheckMs = 0;
+static uint32_t lastModeCheckMs = 0;
+static uint32_t panStallStartMs = 0;
+static uint32_t tiltStallStartMs = 0;
+static bool panInStall = false;
+static bool tiltInStall = false;
+static bool thermalThrottleActive = false;
+
 // ----------------------------- CRC8 (poly 0x07, init 0x00) -----------------------------
 static uint8_t crc8(const uint8_t* data, size_t len) {
   uint8_t crc = 0x00;
@@ -285,6 +319,15 @@ static void sendFrame(uint16_t seq, uint16_t type, const uint8_t* payload, size_
 }
 
 // NACK: code 1=checksum, 2=unknown type, 3=state rejected, 4=execution failed
+// Safety NACK codes: 10=stall, 11=overcurrent, 12=mode_corruption, 13=thermal
+static const uint8_t SAFETY_ERR_STALL = 10;
+static const uint8_t SAFETY_ERR_OVERCURRENT = 11;
+static const uint8_t SAFETY_ERR_MODE_CORRUPTION = 12;
+static const uint8_t SAFETY_ERR_THERMAL = 13;
+
+// Safety alert response type
+static const uint16_t RSP_SAFETY_ALERT = 3000;
+
 static void sendNack(uint16_t seq, uint8_t code) {
   uint8_t pl[] = { code };
   sendFrame(seq, RSP_NACK, pl, 1);
@@ -295,6 +338,23 @@ static float clampFloat(float value, float minValue, float maxValue) {
   if (value < minValue) return minValue;
   if (value > maxValue) return maxValue;
   return value;
+}
+
+// SAFETY: Validate and limit speed/acceleration values
+static uint16_t validateSpeed(uint16_t spd) {
+  if (spd == 0) spd = 3400;  // Default
+  if (spd > MAX_SERVO_SPEED) spd = MAX_SERVO_SPEED;
+  // Apply thermal throttling if active
+  if (thermalThrottleActive && spd > THERMAL_THROTTLE_SPEED) {
+    spd = THERMAL_THROTTLE_SPEED;
+  }
+  return spd;
+}
+
+static uint16_t validateAccel(uint16_t acc) {
+  if (acc == 0) acc = 100;  // Default
+  if (acc > MAX_SERVO_ACCEL) acc = MAX_SERVO_ACCEL;
+  return acc;
 }
 
 static uint16_t panDegToPos(float deg) {
@@ -398,6 +458,204 @@ static void setTiltServoAngleLimits() {
     delay(10);
     st.LockEprom(TILT_SERVO_ID);
     delay(10);
+  }
+}
+
+// SAFETY FIX 1.1: Set pan servo EPROM angle limits (hardware protection)
+// Pan uses SERVO_CENTER + deg*DEG_TO_POS: -180° -> 0, +180° -> 4095
+static const uint16_t PAN_POS_MIN = 0;      // position for -180°
+static const uint16_t PAN_POS_MAX = 4095;   // position for +180°
+static void setPanServoAngleLimits() {
+  if (st.unLockEprom(PAN_SERVO_ID) != -1) {
+    delay(10);
+    st.writeWord(PAN_SERVO_ID, SMS_STS_MIN_ANGLE_LIMIT_L, PAN_POS_MIN);
+    delay(10);
+    st.writeWord(PAN_SERVO_ID, SMS_STS_MAX_ANGLE_LIMIT_L, PAN_POS_MAX);
+    delay(10);
+    st.LockEprom(PAN_SERVO_ID);
+    delay(10);
+  }
+}
+
+// ----------------------------- Safety Functions -----------------------------
+
+// Send safety alert to host
+static void sendSafetyAlert(uint8_t alertCode, const char* message) {
+  uint8_t buf[33];
+  buf[0] = alertCode;
+  size_t msgLen = strlen(message);
+  if (msgLen > 31) msgLen = 31;
+  memcpy(&buf[1], message, msgLen);
+  buf[1 + msgLen] = '\0';
+  sendFrame(0, RSP_SAFETY_ALERT, buf, 1 + msgLen + 1);
+}
+
+// Emergency stop - disable all servos immediately
+static void emergencyStop(uint8_t reason) {
+  // Disable torque on both servos
+  st.EnableTorque(PAN_SERVO_ID, 0);
+  st.EnableTorque(TILT_SERVO_ID, 0);
+
+  // Update state
+  panLocked = false;
+  tiltLocked = false;
+  safetyStopTriggered = true;
+  safetyStopReason = reason;
+
+  // Return to IDLE state
+  if (gimbalState == TRACKING) {
+    gimbalState = IDLE;
+  }
+
+  // Send alert
+  const char* msg = "Unknown";
+  switch (reason) {
+    case SAFETY_ERR_STALL: msg = "Stall detected"; break;
+    case SAFETY_ERR_OVERCURRENT: msg = "Overcurrent"; break;
+    case SAFETY_ERR_MODE_CORRUPTION: msg = "Mode corruption"; break;
+    case SAFETY_ERR_THERMAL: msg = "Thermal critical"; break;
+  }
+  sendSafetyAlert(reason, msg);
+}
+
+// SAFETY FIX 5.1: Check for servo stall condition
+static void checkServoStall() {
+  uint32_t now = millis();
+  if (now - lastStallCheckMs < STALL_CHECK_INTERVAL_MS) return;
+  lastStallCheckMs = now;
+
+  // Only check when servos are active (not in safety stop)
+  if (safetyStopTriggered) return;
+
+  // Read servo loads
+  int16_t panLoad = 0, panPos = 0, tiltLoad = 0, tiltPos = 0;
+  readServoFeedbackTracking(PAN_SERVO_ID, &panLoad, &panPos);
+  readServoFeedbackTracking(TILT_SERVO_ID, &tiltLoad, &tiltPos);
+
+  // Check pan servo stall
+  if (abs(panLoad) > STALL_LOAD_THRESHOLD) {
+    if (!panInStall) {
+      panInStall = true;
+      panStallStartMs = now;
+    } else if (now - panStallStartMs > STALL_TIME_THRESHOLD_MS) {
+      emergencyStop(SAFETY_ERR_STALL);
+      return;
+    }
+  } else {
+    panInStall = false;
+  }
+
+  // Check tilt servo stall
+  if (abs(tiltLoad) > STALL_LOAD_THRESHOLD) {
+    if (!tiltInStall) {
+      tiltInStall = true;
+      tiltStallStartMs = now;
+    } else if (now - tiltStallStartMs > STALL_TIME_THRESHOLD_MS) {
+      emergencyStop(SAFETY_ERR_STALL);
+      return;
+    }
+  } else {
+    tiltInStall = false;
+  }
+}
+
+// SAFETY FIX 5.2: Check bus current limit
+static void checkBusCurrent() {
+  // Only check when not already in safety stop
+  if (safetyStopTriggered) return;
+
+  if (current_mA > MAX_BUS_CURRENT_MA) {
+    emergencyStop(SAFETY_ERR_OVERCURRENT);
+  }
+}
+
+// SAFETY FIX 2.1: Verify servos are in position mode (not wheel mode)
+static void verifyServoModes() {
+  uint32_t now = millis();
+  if (now - lastModeCheckMs < MODE_CHECK_INTERVAL_MS) return;
+  lastModeCheckMs = now;
+
+  // Only check when not already in safety stop
+  if (safetyStopTriggered) return;
+
+  byte panMode = st.ReadMode(PAN_SERVO_ID);
+  byte tiltMode = st.ReadMode(TILT_SERVO_ID);
+
+  // Mode 0 = position control, Mode 1 = wheel mode
+  if (panMode != 0 || tiltMode != 0) {
+    // Try to fix it first
+    if (panMode != 0) {
+      st.writeByte(PAN_SERVO_ID, SMS_STS_MODE, 0);
+      delay(5);
+    }
+    if (tiltMode != 0) {
+      st.writeByte(TILT_SERVO_ID, SMS_STS_MODE, 0);
+      delay(5);
+    }
+
+    // Re-check
+    panMode = st.ReadMode(PAN_SERVO_ID);
+    tiltMode = st.ReadMode(TILT_SERVO_ID);
+
+    // If still not in position mode, emergency stop
+    if (panMode != 0 || tiltMode != 0) {
+      emergencyStop(SAFETY_ERR_MODE_CORRUPTION);
+    }
+  }
+}
+
+// SAFETY FIX 9.1: Check servo temperatures
+static void checkServoTemperature() {
+  // Only check when not already in safety stop
+  if (safetyStopTriggered) return;
+
+  // Read temperatures (requires full feedback read)
+  ServoFeedback tempFb;
+  float panTemp = 0, tiltTemp = 0;
+
+  if (readServoFeedback(PAN_SERVO_ID, tempFb)) {
+    panTemp = tempFb.temp;
+  }
+  if (readServoFeedback(TILT_SERVO_ID, tempFb)) {
+    tiltTemp = tempFb.temp;
+  }
+
+  // Critical temperature - emergency stop
+  if (panTemp > SERVO_TEMP_CRITICAL || tiltTemp > SERVO_TEMP_CRITICAL) {
+    emergencyStop(SAFETY_ERR_THERMAL);
+    return;
+  }
+
+  // Warning temperature - enable thermal throttle (reduce speed)
+  if (panTemp > SERVO_TEMP_WARNING || tiltTemp > SERVO_TEMP_WARNING) {
+    if (!thermalThrottleActive) {
+      thermalThrottleActive = true;
+      sendSafetyAlert(SAFETY_ERR_THERMAL, "Thermal warning - throttling");
+    }
+  } else {
+    thermalThrottleActive = false;
+  }
+}
+
+// Reset safety state (allow operation after safety stop)
+static void resetSafetyState() {
+  safetyStopTriggered = false;
+  safetyStopReason = 0;
+  panInStall = false;
+  tiltInStall = false;
+  thermalThrottleActive = false;
+}
+
+// Run all safety checks
+static void runSafetyChecks() {
+  checkServoStall();
+  checkBusCurrent();
+  verifyServoModes();
+  // Temperature check is slower, run less frequently
+  static uint32_t lastTempCheckMs = 0;
+  if (millis() - lastTempCheckMs > 5000) {  // Every 5 seconds
+    checkServoTemperature();
+    lastTempCheckMs = millis();
   }
 }
 
@@ -1059,6 +1317,7 @@ static void processCommand(uint16_t seq, uint16_t type, const uint8_t* payload, 
       handleSwitchFw(seq, payload, payloadLen);
       return;
     case CMD_ENTER_TRACKING:
+      if (safetyStopTriggered) { sendNack(seq, SAFETY_ERR_STALL); return; }
       gimbalState = TRACKING;
       onEnterTracking();
       sendFrame(seq, RSP_ACK_EXECUTED, nullptr, 0);
@@ -1074,11 +1333,13 @@ static void processCommand(uint16_t seq, uint16_t type, const uint8_t* payload, 
 
     case CMD_PAN_TILT_ABS: {
       if (payloadLen < 12) { sendNack(seq, 4); return; }
+      // Block commands if safety stop is active
+      if (safetyStopTriggered) { sendNack(seq, SAFETY_ERR_STALL); return; }
       float pan, tilt;
       memcpy(&pan, &payload[0], 4); memcpy(&tilt, &payload[4], 4);
       uint16_t spd = (uint16_t)payload[8] | ((uint16_t)payload[9] << 8);
       uint16_t acc = (uint16_t)payload[10] | ((uint16_t)payload[11] << 8);
-      if (spd == 0) spd = 3400; if (acc == 0) acc = 100;
+      spd = validateSpeed(spd); acc = validateAccel(acc);  // SAFETY: Validate params
       lastPanCmdMs = millis(); lastTiltCmdMs = millis(); touchHeartbeat();
       if (gimbalState == TRACKING) {
         setPanTiltAbsTracking(pan, tilt, spd, acc);
@@ -1090,11 +1351,12 @@ static void processCommand(uint16_t seq, uint16_t type, const uint8_t* payload, 
     } break;
     case CMD_PAN_TILT_MOVE: {
       if (payloadLen < 12) { sendNack(seq, 4); return; }
+      if (safetyStopTriggered) { sendNack(seq, SAFETY_ERR_STALL); return; }
       float pan, tilt;
       memcpy(&pan, &payload[0], 4); memcpy(&tilt, &payload[4], 4);
       uint16_t spdPan = (uint16_t)payload[8] | ((uint16_t)payload[9] << 8);
       uint16_t spdTilt = (uint16_t)payload[10] | ((uint16_t)payload[11] << 8);
-      if (spdPan == 0) spdPan = 3400; if (spdTilt == 0) spdTilt = 3400;
+      spdPan = validateSpeed(spdPan); spdTilt = validateSpeed(spdTilt);
       lastPanCmdMs = millis(); lastTiltCmdMs = millis(); touchHeartbeat();
       if (gimbalState == TRACKING) {
         setPanTiltMoveTracking(pan, tilt, spdPan, spdTilt);
@@ -1106,10 +1368,11 @@ static void processCommand(uint16_t seq, uint16_t type, const uint8_t* payload, 
     } break;
     case CMD_PAN_ONLY_ABS: {
       if (payloadLen < 8) { sendNack(seq, 4); return; }
+      if (safetyStopTriggered) { sendNack(seq, SAFETY_ERR_STALL); return; }
       float pan; memcpy(&pan, &payload[0], 4);
       uint16_t spd = (uint16_t)payload[4] | ((uint16_t)payload[5] << 8);
       uint16_t acc = (uint16_t)payload[6] | ((uint16_t)payload[7] << 8);
-      if (spd == 0) spd = 3400; if (acc == 0) acc = 100;
+      spd = validateSpeed(spd); acc = validateAccel(acc);
       lastPanCmdMs = millis(); touchHeartbeat();
       if (gimbalState == TRACKING) {
         setPanAbsTracking(pan, spd, acc);
@@ -1121,10 +1384,11 @@ static void processCommand(uint16_t seq, uint16_t type, const uint8_t* payload, 
     } break;
     case CMD_TILT_ONLY_ABS: {
       if (payloadLen < 8) { sendNack(seq, 4); return; }
+      if (safetyStopTriggered) { sendNack(seq, SAFETY_ERR_STALL); return; }
       float tilt; memcpy(&tilt, &payload[0], 4);
       uint16_t spd = (uint16_t)payload[4] | ((uint16_t)payload[5] << 8);
       uint16_t acc = (uint16_t)payload[6] | ((uint16_t)payload[7] << 8);
-      if (spd == 0) spd = 3400; if (acc == 0) acc = 100;
+      spd = validateSpeed(spd); acc = validateAccel(acc);
       lastTiltCmdMs = millis(); touchHeartbeat();
       if (gimbalState == TRACKING) {
         setTiltAbsTracking(tilt, spd, acc);
@@ -1136,9 +1400,10 @@ static void processCommand(uint16_t seq, uint16_t type, const uint8_t* payload, 
     } break;
     case CMD_PAN_ONLY_MOVE: {
       if (payloadLen < 6) { sendNack(seq, 4); return; }
+      if (safetyStopTriggered) { sendNack(seq, SAFETY_ERR_STALL); return; }
       float pan; memcpy(&pan, &payload[0], 4);
       uint16_t spd = (uint16_t)payload[4] | ((uint16_t)payload[5] << 8);
-      if (spd == 0) spd = 3400;
+      spd = validateSpeed(spd);
       lastPanCmdMs = millis(); touchHeartbeat();
       if (gimbalState == TRACKING) {
         setPanMoveTracking(pan, spd);
@@ -1150,9 +1415,10 @@ static void processCommand(uint16_t seq, uint16_t type, const uint8_t* payload, 
     } break;
     case CMD_TILT_ONLY_MOVE: {
       if (payloadLen < 6) { sendNack(seq, 4); return; }
+      if (safetyStopTriggered) { sendNack(seq, SAFETY_ERR_STALL); return; }
       float tilt; memcpy(&tilt, &payload[0], 4);
       uint16_t spd = (uint16_t)payload[4] | ((uint16_t)payload[5] << 8);
-      if (spd == 0) spd = 3400;
+      spd = validateSpeed(spd);
       lastTiltCmdMs = millis(); touchHeartbeat();
       if (gimbalState == TRACKING) {
         setTiltMoveTracking(tilt, spd);
@@ -1170,9 +1436,10 @@ static void processCommand(uint16_t seq, uint16_t type, const uint8_t* payload, 
       break;
     case CMD_USER_CTRL: {
       if (payloadLen < 4) { sendNack(seq, 4); return; }
+      if (safetyStopTriggered) { sendNack(seq, SAFETY_ERR_STALL); return; }
       int8_t x = (int8_t)payload[0], y = (int8_t)payload[1];
       uint16_t spd = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
-      if (spd == 0) spd = 300;
+      spd = validateSpeed(spd == 0 ? 300 : spd);
       lastPanCmdMs = millis(); lastTiltCmdMs = millis(); touchHeartbeat();
       handleUserCtrl(x, y, spd);
       sendFrame(seq, RSP_ACK_EXECUTED, nullptr, 0);
@@ -1200,6 +1467,28 @@ static void processCommand(uint16_t seq, uint16_t type, const uint8_t* payload, 
     case CMD_GET_STATE: {
       uint8_t stateByte = (uint8_t)gimbalState;  // 0=IDLE, 1=TRACKING, 2=CONFIG, 3=OTA_RECEIVE
       sendFrame(seq, FEEDBACK_STATE, &stateByte, 1);
+    } break;
+    case CMD_RESET_SAFETY: {
+      // Reset safety state and re-enable servos
+      resetSafetyState();
+      ensurePositionMode(PAN_SERVO_ID);
+      ensurePositionMode(TILT_SERVO_ID);
+      delay(5);
+      st.EnableTorque(PAN_SERVO_ID, 1);
+      st.EnableTorque(TILT_SERVO_ID, 1);
+      panLocked = true;
+      tiltLocked = true;
+      sendFrame(seq, RSP_ACK_EXECUTED, nullptr, 0);
+    } break;
+    case CMD_GET_SAFETY_STATUS: {
+      // Return safety status: triggered(1), reason(1), panStall(1), tiltStall(1), thermal(1)
+      uint8_t buf[5];
+      buf[0] = safetyStopTriggered ? 1 : 0;
+      buf[1] = safetyStopReason;
+      buf[2] = panInStall ? 1 : 0;
+      buf[3] = tiltInStall ? 1 : 0;
+      buf[4] = thermalThrottleActive ? 1 : 0;
+      sendFrame(seq, (uint16_t)1014, buf, 5);  // FEEDBACK_SAFETY_STATUS
     } break;
     case CMD_FEEDBACK_FLOW:
       if (payloadLen >= 1) feedbackEnabled = (payload[0] == 1);
@@ -1378,8 +1667,9 @@ void setup() {
   // Set torque limit to max (EPROM unlock/lock per v0.9)
   setServoTorqueLimitMax(PAN_SERVO_ID);
   setServoTorqueLimitMax(TILT_SERVO_ID);
-  // Set tilt servo EPROM angle limits so -90° to 120° is allowed (not clamped by factory limits)
-  setTiltServoAngleLimits();
+  // SAFETY FIX 1.1: Set servo EPROM angle limits (hardware protection)
+  setPanServoAngleLimits();   // Pan: -180° to +180°
+  setTiltServoAngleLimits();  // Tilt: -90° to +120°
   delay(10);
   // Enable torque on both servos
   st.EnableTorque(PAN_SERVO_ID, 1);
@@ -1408,6 +1698,13 @@ void loop() {
   if (now - lastInaMs >= INA_UPDATE_MS) {
     updateIna219();
     lastInaMs = now;
+    // SAFETY FIX 5.2: Check bus current immediately after reading
+    checkBusCurrent();
+  }
+
+  // SAFETY: Run safety checks (stall detection, mode verification)
+  if (!safetyStopTriggered && gimbalState != OTA_RECEIVE) {
+    runSafetyChecks();
   }
   // Disable periodic feedback reads to avoid interference
   // Only read when explicitly requested (via sendServoFeedback)

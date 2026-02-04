@@ -47,6 +47,15 @@ from protocol import (
     CMD_EXIT_CONFIG,
     CMD_SET_SERVO_ID,
     CMD_CALIBRATE,
+    CMD_GET_STATE,
+    CMD_RESET_SAFETY,
+    CMD_GET_SAFETY_STATUS,
+    RSP_SAFETY_ALERT,
+    FEEDBACK_SAFETY_STATUS,
+    SAFETY_ERR_STALL,
+    SAFETY_ERR_OVERCURRENT,
+    SAFETY_ERR_MODE_CORRUPTION,
+    SAFETY_ERR_THERMAL,
 )
 
 import struct
@@ -343,16 +352,86 @@ def run_stage_9(ser: serial.Serial, seq: int) -> Tuple[bool, str]:
 
 
 def run_stage_10(ser: serial.Serial, seq: int) -> Tuple[bool, str]:
+    """Get gimbal state: CMD_GET_STATE -> ACK_RECEIVED then 1013 (1B state)."""
+    ok, msg = run_command(
+        ser, seq, CMD_GET_STATE, b"",
+        expect_types=[RSP_ACK_RECEIVED, 1013],
+        expect_payload_len=1,
+        timeout=DEFAULT_TIMEOUT,
+    )
+    if not ok:
+        return False, f"GET_STATE: {msg}"
+    return True, ""
+
+
+def run_stage_11(ser: serial.Serial, seq: int) -> Tuple[bool, str]:
+    """Safety status query: CMD_GET_SAFETY_STATUS -> ACK_RECEIVED then 1014 (safety status)."""
+    ok, msg = run_command(
+        ser, seq, CMD_GET_SAFETY_STATUS, b"",
+        expect_types=[RSP_ACK_RECEIVED, FEEDBACK_SAFETY_STATUS],
+        expect_payload_len=5,  # triggered(1) + reason(1) + panStall(1) + tiltStall(1) + thermal(1)
+        timeout=DEFAULT_TIMEOUT,
+    )
+    if not ok:
+        return False, f"GET_SAFETY_STATUS: {msg}"
+    return True, ""
+
+
+def run_stage_12(ser: serial.Serial, seq: int) -> Tuple[bool, str]:
+    """Safety reset: CMD_RESET_SAFETY -> ACK_EXECUTED."""
+    ok, msg = run_command(
+        ser, seq, CMD_RESET_SAFETY, b"",
+        expect_types=[RSP_ACK_RECEIVED, RSP_ACK_EXECUTED],
+        timeout=DEFAULT_TIMEOUT,
+    )
+    if not ok:
+        return False, f"RESET_SAFETY: {msg}"
+    return True, ""
+
+
+def run_stage_13(ser: serial.Serial, seq: int) -> Tuple[bool, str]:
+    """Speed/acceleration validation: verify move commands accept params within limits."""
+    # Ensure we're in TRACKING mode first
+    ok, msg = run_command(ser, seq, CMD_ENTER_TRACKING, b"",
+                          expect_types=[RSP_ACK_RECEIVED, RSP_ACK_EXECUTED],
+                          timeout=DEFAULT_TIMEOUT)
+    if not ok:
+        return False, f"ENTER_TRACKING: {msg}"
+    seq = next_seq(seq)
+
+    # Test with valid speed (within MAX_SERVO_SPEED=4000) and accel (within MAX_SERVO_ACCEL=254)
+    # PAN_TILT_ABS: pan(float), tilt(float), speed(uint16), accel(uint16)
+    valid_speed = 2000
+    valid_accel = 100
+    payload = struct.pack("<ffHH", 0.0, 0.0, valid_speed, valid_accel)
+    ok, msg, fb = run_command_with_feedback(ser, seq, CMD_PAN_TILT_ABS, payload, timeout=DEFAULT_TIMEOUT)
+    if not ok:
+        return False, f"Valid speed/accel test: {msg}"
+    seq = next_seq(seq)
+
+    # Test with excessive speed (should be clamped to MAX_SERVO_SPEED=4000)
+    # The firmware should accept the command but clamp internally
+    excessive_speed = 10000
+    excessive_accel = 500
+    payload = struct.pack("<ffHH", 0.0, 0.0, excessive_speed, excessive_accel)
+    ok, msg, fb = run_command_with_feedback(ser, seq, CMD_PAN_TILT_ABS, payload, timeout=DEFAULT_TIMEOUT)
+    if not ok:
+        return False, f"Excessive speed test (should be clamped): {msg}"
+
+    return True, ""
+
+
+def run_stage_14(ser: serial.Serial, seq: int) -> Tuple[bool, str]:
     """Optional destructive: SET_SERVO_ID, CALIBRATE. Skip by default."""
     # SET_SERVO_ID changes hardware ID - only on test fixture. We skip actual change and only check response type.
     # CALIBRATE sets current position as middle - changes calibration.
-    return False, "Stage 10 (destructive) skipped; use --run-destructive to enable"
+    return False, "Stage 14 (destructive) skipped; use --run-destructive to enable"
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Gimbal step-by-step auto-tester")
     ap.add_argument("port", nargs="?", default="COM3", help="Serial port (default COM3)")
-    ap.add_argument("--run-destructive", action="store_true", help="Run stage 10 (SET_SERVO_ID, CALIBRATE)")
+    ap.add_argument("--run-destructive", action="store_true", help="Run stage 14 (SET_SERVO_ID, CALIBRATE)")
     ap.add_argument("--baud", type=int, default=BAUD, help=f"Baud rate (default {BAUD})")
     args = ap.parse_args()
 
@@ -375,9 +454,13 @@ def main() -> int:
         (7, "CONFIG + PING", run_stage_7),
         (8, "Register R/W", run_stage_8),
         (9, "EXIT_CONFIG + TRACKING", run_stage_9),
+        (10, "Get gimbal state", run_stage_10),
+        (11, "Safety status query", run_stage_11),
+        (12, "Safety reset", run_stage_12),
+        (13, "Speed/accel validation", run_stage_13),
     ]
     if args.run_destructive:
-        stages.append((10, "Destructive (SET_ID/CALIBRATE)", run_stage_10))
+        stages.append((14, "Destructive (SET_ID/CALIBRATE)", run_stage_14))
 
     results: List[Tuple[int, str, bool, str]] = []
     seq = 1
