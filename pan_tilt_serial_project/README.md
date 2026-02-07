@@ -26,6 +26,14 @@ The new firmware adds extended features and protocol support used by the web GUI
 
 ---
 
+### Serial protocol
+
+Binary frame format and command/response types. Full spec: [SERIAL_PROTOCOL.md](docs/SERIAL_PROTOCOL.md).
+
+![Serial protocol](https://raw.githubusercontent.com/warunafernando/gimble_conrol/main/pan_tilt_serial_project/docs/SerialProtocol.png)
+
+---
+
 ## Quick start
 
 1. **Build firmware** (PlatformIO):

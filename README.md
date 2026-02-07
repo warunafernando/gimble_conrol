@@ -26,6 +26,14 @@ The new firmware adds extended features and protocol support used by the web GUI
 
 ---
 
+### Serial protocol
+
+Binary frame format (STX, LEN, SEQ, TYPE, PAYLOAD, CRC8, ETX) and command/response types. See [SERIAL_PROTOCOL.md](pan_tilt_serial_project/docs/SERIAL_PROTOCOL.md) for the full spec.
+
+![Serial protocol](https://raw.githubusercontent.com/warunafernando/gimble_conrol/main/pan_tilt_serial_project/docs/SerialProtocol.png)
+
+---
+
 ## Project
 
 Main code and docs are in **[pan_tilt_serial_project/](pan_tilt_serial_project/)**:
