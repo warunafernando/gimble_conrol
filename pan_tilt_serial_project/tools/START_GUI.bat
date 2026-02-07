@@ -1,13 +1,7 @@
 @echo off
-title Pan-Tilt Test GUI
-echo ========================================
-echo Starting Pan-Tilt Test GUI...
-echo ========================================
-cd /d "%~dp0"
-python pan_tilt_test_gui.py
-if errorlevel 1 (
-    echo.
-    echo ERROR: Failed to start GUI
-    echo.
-    pause
-)
+set BACKEND=%~dp0..\backend
+echo Starting backend from %BACKEND%...
+start "Gimbal Backend" cmd /k "cd /d "%BACKEND%" && python app.py"
+timeout /t 3 /nobreak >nul
+start http://localhost:5000
+echo Browser opened. Close the backend window to stop the server.

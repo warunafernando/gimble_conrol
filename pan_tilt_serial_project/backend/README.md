@@ -1,12 +1,14 @@
 # Gimbal PC Backend
 
-Runs on the PC: connects to the ESP32 over serial (binary protocol per GIMBAL_PROTOCOL.md) and pushes data to a web GUI via WebSocket.
+Runs on the PC: connects to the ESP32 over serial (binary protocol per GIMBAL_PROTOCOL.md) and serves a web GUI with WebSocket push.
 
 ## Features
 
-- **Serial bridge**: Binary frame RX/TX to ESP32 at 921600 baud
-- **WebSocket push**: Live pan/tilt/torque (from ACK_EXECUTED), IMU (type 1002), connection state
-- **Debug**: Ring buffer of last 500 log lines (serial open/close, RX/TX, parsed frames); debug panel in web GUI with refresh and live tail
+- **Auto-connect**: On startup, scans COM ports and connects to the first gimbal with model ID 99 (keeps port open; no close/reopen).
+- **Serial bridge**: Binary frame RX/TX to ESP32 at 921600 baud.
+- **WebSocket push**: Live pan/tilt, IMU, connection state, FW info.
+- **Keepalive**: Every 30 s checks connection; disconnects if no response.
+- **Debug**: Ring buffer of last 500 log lines; debug panel in web GUI.
 
 ## Setup
 
@@ -18,12 +20,10 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-python app.py [PORT]
+python app.py
 ```
 
-Example: `python app.py COM3` (Windows) or `python app.py /dev/ttyUSB0` (Linux).
-
-Then open http://localhost:5000 in a browser. Use the Connection panel to set port/baud and Connect. Use Commands to send Enter tracking (137) or Get IMU (126). Debug log shows serial activity.
+No port argument: the backend discovers the gimbal automatically. Then open http://localhost:5000 in a browser. The Connection & FW Info table shows COM port, status (Connected / Not connected), FW version, serial number, and a Disconnect button. Use **Rescan and connect** if you unplug and replug the gimbal.
 
 ## Protocol
 

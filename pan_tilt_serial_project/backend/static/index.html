@@ -40,8 +40,11 @@
     }
     .panel h2 { font-size: 0.85rem; margin: 0 0 8px 0; color: #888; text-transform: uppercase; }
     .status { display: flex; align-items: center; gap: 8px; }
-    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--err); }
-    .dot.connected { background: var(--ok); }
+    .conn-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    .conn-table th { text-align: left; padding: 6px 8px; color: #888; font-weight: normal; border-bottom: 1px solid var(--border); }
+    .conn-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+    .conn-table .status-ok { color: var(--ok); }
+    .conn-table .status-no { color: #888; }
     .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
     input[type="text"], input[type="number"] {
       background: #25252d;
@@ -158,32 +161,27 @@
   </style>
 </head>
 <body>
-  <h1>Gimbal Web GUI <span id="fwVersion" class="fw-ver">—</span></h1>
+  <h1>Gimbal Web GUI</h1>
 
   <div class="row">
-    <div class="panel fw-panel">
-      <h2>FW Info</h2>
-      <div class="fw-slot" id="fwSlotA">
-        <span class="label">A:</span> <span id="fwVerA">—</span> <span id="fwActiveA" class="label"></span>
-      </div>
-      <div class="fw-slot" id="fwSlotB">
-        <span class="label">B:</span> <span id="fwVerB">—</span> <span id="fwActiveB" class="label"></span>
-      </div>
-      <button id="cmdGetFwInfo" style="margin-top:6px">Get FW Info (610)</button>
-    </div>
-    <div class="panel">
-      <h2>Connection</h2>
-      <div class="status">
-        <span class="dot" id="dot"></span>
-        <span id="connStatus">Disconnected</span>
-      </div>
-      <div class="controls" style="margin-top:10px">
-        <label>Port: <select id="portSelect"><option value="COM9">COM9</option></select></label>
-        <button id="btnRefreshPorts" type="button" title="Scan for COM ports">Refresh ports</button>
-        <input type="text" id="port" value="COM9" placeholder="Port" style="width:70px;" />
-        <input type="text" id="baud" value="921600" placeholder="Baud" />
-        <button id="btnConnect">Connect</button>
-        <button id="btnDisconnect" class="danger" disabled>Disconnect</button>
+    <div class="panel fw-panel" style="min-width: 320px;">
+      <h2>Connection &amp; FW Info</h2>
+      <table class="conn-table">
+        <thead>
+          <tr><th>COM port</th><th>Status</th><th>FW version</th><th>Serial</th><th></th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td id="connPort">—</td>
+            <td id="connStatus" class="status-no">Not connected</td>
+            <td id="connFwVersion">—</td>
+            <td id="connSerial">—</td>
+            <td><button id="btnDisconnect" class="danger" type="button" disabled>Disconnect</button></td>
+          </tr>
+        </tbody>
+      </table>
+      <div style="margin-top: 10px;">
+        <button id="btnRescan" type="button">Rescan and connect</button>
       </div>
     </div>
     <div class="panel">
@@ -413,12 +411,13 @@
       ? window.location.origin
       : 'http://localhost:5000';
     const socket = io(socketUrl, { transports: ['websocket', 'polling'], reconnection: true, reconnectionAttempts: 20, reconnectionDelay: 2000 });
-    const dot = document.getElementById('dot');
-    const connStatus = document.getElementById('connStatus');
-    const portInput = document.getElementById('port');
-    const baudInput = document.getElementById('baud');
-    const btnConnect = document.getElementById('btnConnect');
+    const connStatusEl = document.getElementById('connStatus');
+    const connPortEl = document.getElementById('connPort');
+    const connFwVersionEl = document.getElementById('connFwVersion');
+    const connSerialEl = document.getElementById('connSerial');
     const btnDisconnect = document.getElementById('btnDisconnect');
+    const btnRescan = document.getElementById('btnRescan');
+    let connectionState = { connected: false };
     const liveMove = document.getElementById('liveMove');
     const liveImu = document.getElementById('liveImu');
     const liveIna = document.getElementById('liveIna');
@@ -444,18 +443,22 @@
     }
 
     function setConnected(connected) {
-      dot.classList.toggle('connected', connected);
-      connStatus.textContent = connected ? 'Connected' : 'Disconnected';
-      btnConnect.disabled = connected;
+      connectionState.connected = connected;
+      connStatusEl.textContent = connected ? 'Connected' : 'Not connected';
+      connStatusEl.className = connected ? 'status-ok' : 'status-no';
       btnDisconnect.disabled = !connected;
     }
 
     socket.on('state', function (s) {
       setConnected(s.connected);
-      if (s.port) {
-        portInput.value = s.port;
-        var sel = document.getElementById('portSelect');
-        if (sel && sel.querySelector('option[value="' + s.port + '"]')) sel.value = s.port;
+      if (connPortEl) connPortEl.textContent = (s.port && s.port.trim()) ? s.port : '—';
+      if (connSerialEl) connSerialEl.textContent = (s.gimbal_serial !== undefined && s.gimbal_serial !== null) ? String(s.gimbal_serial) : '—';
+      if (connFwVersionEl) {
+        if (s.fw_info) {
+          var active = s.fw_info.active_slot === 0 ? 0 : 1;
+          var v = active === 0 ? (s.fw_info.version_a || '—') : (s.fw_info.version_b || '—');
+          connFwVersionEl.textContent = (v && v.trim()) ? v.trim() : '—';
+        } else connFwVersionEl.textContent = '—';
       }
       if (s.fw_info) updateFwDisplay(s.fw_info);
       if (s.last_imu && s.last_imu.yaw != null) {
@@ -513,7 +516,7 @@
       // Auto-tracking logic
       if (autoTrackEnabled) {
         // Check if serial is connected before sending commands
-        const connected = dot.classList.contains('connected');
+        const connected = connectionState.connected;
         if (!connected) {
           // Disable auto-track if connection lost
           autoTrackEnabled = false;
@@ -590,7 +593,7 @@
         recoverInterval = null;
       }
       scanInterval = setInterval(function() {
-        const connected = dot.classList.contains('connected');
+        const connected = connectionState.connected;
         if (!connected) return;
         currentPan += SCAN_STEP * scanDirection;
         if (currentPan >= 180 || currentPan <= -180) {
@@ -609,7 +612,7 @@
         scanInterval = null;
       }
       recoverInterval = setInterval(function() {
-        const connected = dot.classList.contains('connected');
+        const connected = connectionState.connected;
         if (!connected) return;
         if (lastPanPosDeg != null) currentPan = lastPanPosDeg;
         currentPan += RECOVER_STEP * recoverDirection;
@@ -624,9 +627,9 @@
     // Auto-track toggle button
     document.getElementById('btnAutoTrack').onclick = function() {
       // Check if serial is connected
-      const connected = dot.classList.contains('connected');
+      const connected = connectionState.connected;
       if (!connected) {
-        alert('Please connect to serial port (COM9) first');
+        alert('Gimbal not connected. Plug in the device or click Re-scan.');
         return;
       }
       
@@ -720,7 +723,7 @@
           } else {
             liveIna.textContent = `bus_v ${(a.bus_v != null ? a.bus_v : 0).toFixed(3)} V  load_v ${(a.load_v != null ? a.load_v : 0).toFixed(3)} V\ncurrent_ma ${(a.current_ma != null ? a.current_ma : 0).toFixed(2)} mA  power_mw ${(a.power_mw != null ? a.power_mw : 0).toFixed(1)} mW\nshunt_mv ${(a.shunt_mv != null ? a.shunt_mv : 0).toFixed(2)} mV  overflow ${a.overflow != null ? a.overflow : 0}`;
           }
-        } else if (data.type === 2610) {
+        } else if (Number(data.type) === 2610) {
           updateFwDisplay(data.payload || {});
         } else if (data.type === 1013) {
           const g = data.payload || {};
@@ -744,25 +747,19 @@
       debugLog.scrollTop = debugLog.scrollHeight;
     });
     socket.on('connect', function () {
-      connStatus.textContent = 'Disconnected';
-      dot.classList.remove('connected');
+      connStatusEl.textContent = 'Not connected';
+      connStatusEl.className = 'status-no';
     });
     socket.on('disconnect', function (reason) {
-      connStatus.textContent = 'Server disconnected. Reconnecting…';
-      dot.classList.remove('connected');
-      btnConnect.disabled = false;
+      connStatusEl.textContent = 'Server disconnected. Reconnecting…';
+      connStatusEl.className = 'status-no';
     });
     socket.on('connect_error', function (err) {
-      connStatus.textContent = 'Cannot reach server';
-      dot.classList.remove('connected');
-      btnConnect.disabled = false;
+      connStatusEl.textContent = 'Cannot reach server';
+      connStatusEl.className = 'status-no';
       console.error('Socket connect_error:', err.message);
     });
-    var connectTimeoutId = null;
     socket.on('connect_serial_result', function (data) {
-      if (connectTimeoutId) { clearTimeout(connectTimeoutId); connectTimeoutId = null; }
-      btnConnect.disabled = false;
-      connStatus.textContent = data.ok ? 'Connected' : 'Disconnected';
       setConnected(data.ok);
       if (!data.ok) alert('Failed to connect to ' + (data.port || '') + (data.error ? '\n' + data.error : ''));
     });
@@ -802,18 +799,14 @@
       if (lastHeadingYaw != null) updateHeadingNeedle(lastHeadingYaw);
     };
     function updateFwDisplay(fw) {
-      const va = (fw.version_a || '').trim() || '—';
-      const vb = (fw.version_b || '').trim() || '—';
-      const active = fw.active_slot === 0 ? 0 : 1;
-      document.getElementById('fwVerA').textContent = va;
-      document.getElementById('fwVerB').textContent = vb;
-      document.getElementById('fwActiveA').textContent = active === 0 ? '(active)' : '(inactive)';
-      document.getElementById('fwActiveB').textContent = active === 1 ? '(active)' : '(inactive)';
-      document.getElementById('fwSlotA').classList.toggle('active', active === 0);
-      document.getElementById('fwSlotB').classList.toggle('active', active === 1);
-      const vTitle = active === 0 ? va : vb;
-      const el = document.getElementById('fwVersion');
-      if (el) el.textContent = (vTitle && vTitle !== '—') ? 'v' + vTitle : '—';
+      if (!fw) return;
+      var active = fw.active_slot === 0 ? 0 : 1;
+      var vTitle = active === 0 ? ((fw.version_a || '').trim() || '—') : ((fw.version_b || '').trim() || '—');
+      if (connFwVersionEl) connFwVersionEl.textContent = (vTitle && vTitle !== '—') ? vTitle : '—';
+      if (connSerialEl) {
+        var serialVal = fw.serial;
+        connSerialEl.textContent = (serialVal !== undefined && serialVal !== null) ? String(serialVal) : '—';
+      }
     }
     function escapeHtml(s) {
       const d = document.createElement('div');
@@ -821,45 +814,13 @@
       return d.innerHTML;
     }
 
-    function refreshSerialPorts() {
-      fetch('/api/serial_ports')
+    btnRescan.onclick = function () {
+      fetch('/api/rescan_serial', { method: 'POST' })
         .then(function(r) { return r.json(); })
         .then(function(d) {
-          var sel = document.getElementById('portSelect');
-          if (!sel) return;
-          var current = sel.value || portInput.value.trim() || 'COM9';
-          sel.innerHTML = (d.ports && d.ports.length) ? d.ports.map(function(p) { return '<option value="' + p + '">' + p + '</option>'; }).join('') : '<option value="COM9">COM9</option>';
-          if (sel.querySelector('option[value="' + current + '"]')) sel.value = current;
-          else if (d.ports && d.ports.length) sel.selectedIndex = 0;
-          portInput.value = sel.value;
+          if (d.ok) connStatusEl.textContent = d.message === 'Already connected' ? 'Connected' : 'Rescanning…';
         })
         .catch(function() {});
-    }
-    var portSelectEl = document.getElementById('portSelect');
-    if (portSelectEl) portSelectEl.onchange = function() { if (portInput) portInput.value = this.value; };
-    document.getElementById('btnRefreshPorts').onclick = refreshSerialPorts;
-    refreshSerialPorts();
-    btnConnect.onclick = function () {
-      if (!socket.connected) {
-        alert('Not connected to server. Refresh the page (F5) and try again.');
-        return;
-      }
-      var sel = document.getElementById('portSelect');
-      var port = (sel && sel.value) ? String(sel.value).trim() : (portInput ? portInput.value : '');
-      port = port || 'COM9';
-      var baud = parseInt(baudInput.value, 10) || 921600;
-      connStatus.textContent = 'Connecting to ' + port + '...';
-      btnConnect.disabled = true;
-      if (connectTimeoutId) clearTimeout(connectTimeoutId);
-      connectTimeoutId = setTimeout(function() {
-        connectTimeoutId = null;
-        btnConnect.disabled = false;
-        if (connStatus.textContent.indexOf('Connecting') === 0) {
-          connStatus.textContent = 'Disconnected';
-          alert('No response from server. Is the backend running?');
-        }
-      }, 15000);
-      socket.emit('connect_serial', { port: port, baud: baud });
     };
     btnDisconnect.onclick = function () { socket.emit('disconnect_serial'); };
     btnRefreshLog.onclick = function () { socket.emit('get_log'); };

@@ -114,7 +114,7 @@ Float: IEEE 754 single (4 bytes). All multi-byte fields little-endian.
 
 | TYPE (hex) | Dec  | Name | Payload layout |
 |------------|------|------|----------------|
-| 0x0A32     | 2610 | FW_INFO | active_slot(1), version_a(32), version_b(32). active_slot: 0=A, 1=B. Version strings null-padded; "---" if partition empty/unreadable. |
+| 0x0A32     | 2610 | FW_INFO | active_slot(1), serial(4 uint32 LE), model_id(1), version_a(32), version_b(32). active_slot: 0=A, 1=B. serial: unique per unit (NVS). model_id: same for all gimbals of this product (e.g. 1). Version strings null-padded; "---" if partition empty/unreadable. 70 bytes. |
 
 Unsolicited or async responses (e.g. IMU on request): SEQ can be 0 or the same as the request if the response is tied to a command.
 

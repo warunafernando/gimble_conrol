@@ -1,4 +1,12 @@
-# Waveshare-Compatible ESP32 Uploader
+# Tools
+
+## Web GUI
+
+To run the gimbal control GUI: **`start_gui.bat`** (starts backend and opens http://localhost:5000). See `../backend/README.md` for backend details.
+
+---
+
+## Waveshare-Compatible ESP32 Uploader
 
 A Python tool that mimics the Waveshare Flash Download Tool behavior for reliable ESP32 firmware uploads on the General Driver for Robots board.
 

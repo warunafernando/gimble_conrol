@@ -1,5 +1,13 @@
 # Quick Start Guide
 
+## Start Web GUI
+
+Double-click `start_gui.bat` or run:
+```bash
+tools\start_gui.bat
+```
+This starts the backend and opens http://localhost:5000 in your browser. The backend auto-connects to the gimbal (model 99) on any COM port. Use **Rescan and connect** if the gimbal was unplugged.
+
 ## Common Issues
 
 ### Port Already in Use

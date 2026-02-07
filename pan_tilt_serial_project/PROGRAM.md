@@ -64,13 +64,10 @@ Created a Python tool (`tools/waveshare_uploader.py`) that mimics the successful
 - **`tools/platformio_upload.py`**: PlatformIO integration script
 
 ### Documentation
-- **`tools/README.md`**: Complete usage guide
+- **`tools/README.md`**: Upload tool usage guide
 - **`tools/INSTALL.md`**: Installation instructions
 - **`tools/QUICK_START.md`**: Quick reference guide
 - **`tools/requirements.txt`**: Python dependencies
-- **`TOOL_CREATED.md`**: Tool creation summary
-- **`UPLOAD_SOLUTION.md`**: Problem analysis and solution
-- **`UPLOAD_FIX.md`**: Troubleshooting guide
 
 ## Usage
 
@@ -186,38 +183,34 @@ Potential enhancements:
 - Fully integrated with PlatformIO workflow
 - Cross-platform (Windows tested, should work on Linux/Mac)
 
-## GUI Test Utility
+## Web GUI
 
-A comprehensive Windows GUI application (`tools/pan_tilt_test_gui.py`) for testing all board functions:
+The main control interface is a web GUI (Flask backend + browser).
 
 ### Features
-- **Pan/Tilt Control**: Absolute, relative, single-axis, lock/unlock
-- **IMU Data Display**: Roll, pitch, yaw, accelerometer, gyroscope, magnetometer, temperature
-- **Power Monitoring**: Voltage, current, power consumption, overflow detection
-- **Servo Feedback**: Position, speed, load, voltage, temperature, mode for both servos
-- **System Control**: Heartbeat timeout, feedback interval, enable/disable
-- **Quick Tests**: Sensor tests, sweep patterns, figure-8 motion
-- **Log Console**: Real-time communication log with save capability
+- **Auto-connect**: Backend scans COM ports on startup and connects to the gimbal (model 99); no manual port selection.
+- **Connection & FW Info**: Table shows COM port, status (Connected / Not connected), FW version, serial number, and Disconnect button.
+- **Rescan and connect**: Button to rescan COM ports when the gimbal is unplugged and reconnected.
+- **Pan/Tilt, IMU, INA, tracking, OTA, debug log**: Same controls and live data as before.
 
 ### Usage
 ```bash
-python tools/pan_tilt_test_gui.py
+tools\start_gui.bat
 ```
-
-Or use the launcher:
+Or start the backend and open the URL manually:
 ```bash
-tools\run_test_gui.bat
+cd backend
+pip install -r requirements.txt
+python app.py
 ```
+Then open http://localhost:5000 in a browser.
 
 ### Requirements
-- Python 3.7+ with tkinter (usually included)
-- pyserial: `pip install pyserial`
+- Python 3.7+
+- Backend: `pip install -r backend/requirements.txt` (Flask, Flask-SocketIO, pyserial, etc.)
 
-See `tools/test_gui_README.md` for complete documentation.
+See `backend/README.md` for backend details and `GIMBAL_PROTOCOL.md` for the binary protocol.
 
 ---
 
-**Created**: 2026-01-26  
-**Status**: ✅ Working and tested successfully  
-**Tested on**: COM6 and COM9  
-**GUI Tool**: ✅ Created and ready for use
+**Status**: Working. Tested on COM6 and COM9.

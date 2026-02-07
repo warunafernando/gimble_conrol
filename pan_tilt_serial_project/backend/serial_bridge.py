@@ -83,8 +83,18 @@ class SerialBridge:
                 return "\\\\.\\" + port_upper
         return port
 
-    def start(self) -> Tuple[bool, Optional[str]]:
-        # On Windows, port can stay locked briefly after close; retry on PermissionError
+    def start(self, existing_serial: Optional[serial.Serial] = None) -> Tuple[bool, Optional[str]]:
+        if existing_serial is not None and existing_serial.is_open:
+            self._serial = existing_serial
+            try:
+                self._serial.timeout = 0.01
+            except Exception:
+                pass
+            self._log(f"Serial using existing {self.port} @ {self.baud}")
+            self._running = True
+            self._thread = threading.Thread(target=self._read_loop, daemon=True)
+            self._thread.start()
+            return True, None
         port_to_use = self._port_name()
         if not port_to_use:
             return False, "Port name is empty"

@@ -372,7 +372,9 @@ def format_rx_for_log(seq: int, type_id: int, payload: bytes) -> str:
         if type_id == RSP_FW_INFO and len(payload) >= 65:
             d = decode_fw_info(payload)
             if d:
-                return f"RX FW_INFO seq={seq} active={d['active_slot']} A={d['version_a']!r} B={d['version_b']!r}"
+                sn = f" sn={d['serial']}" if d.get("serial") is not None else ""
+                mid = f" model={d['model_id']}" if d.get("model_id") is not None else ""
+                return f"RX FW_INFO seq={seq} active={d['active_slot']}{sn}{mid} A={d['version_a']!r} B={d['version_b']!r}"
         if type_id == RSP_I2C_SCAN and len(payload) >= 1:
             d = decode_i2c_scan(payload)
             if d:
@@ -466,14 +468,31 @@ def cmd_switch_fw(seq: int, slot: int) -> bytes:
     return build_frame(seq, CMD_SWITCH_FW, bytes([slot & 1]))
 
 
+# FW_INFO payload lengths: 65 (legacy), 69 (serial), 70 (serial+model_id)
+FW_INFO_PAYLOAD_WITH_MODEL = 70
+FW_INFO_PAYLOAD_WITH_SERIAL = 69
+
+
 def decode_fw_info(payload: bytes) -> Optional[dict]:
-    """Decode FW_INFO: active_slot(1), version_a(32), version_b(32)."""
-    if len(payload) < 1 + FW_VERSION_LEN * 2:
+    """Decode FW_INFO: active_slot(1) [, serial(4)] [, model_id(1)] , version_a(32), version_b(32)."""
+    base_len = 1 + FW_VERSION_LEN * 2  # 65
+    if len(payload) < base_len:
         return None
     active_slot = payload[0]
+    if len(payload) >= FW_INFO_PAYLOAD_WITH_MODEL:  # 70: serial + model_id
+        serial = struct.unpack_from("<I", payload, 1)[0]
+        model_id = payload[5]
+        version_a = payload[6 : 6 + FW_VERSION_LEN].rstrip(b"\x00").decode("utf-8", errors="replace")
+        version_b = payload[6 + FW_VERSION_LEN : 6 + FW_VERSION_LEN * 2].rstrip(b"\x00").decode("utf-8", errors="replace")
+        return {"active_slot": active_slot, "serial": serial, "model_id": model_id, "version_a": version_a, "version_b": version_b}
+    if len(payload) >= FW_INFO_PAYLOAD_WITH_SERIAL:  # 69: serial only
+        serial = struct.unpack_from("<I", payload, 1)[0]
+        version_a = payload[5 : 5 + FW_VERSION_LEN].rstrip(b"\x00").decode("utf-8", errors="replace")
+        version_b = payload[5 + FW_VERSION_LEN : 5 + FW_VERSION_LEN * 2].rstrip(b"\x00").decode("utf-8", errors="replace")
+        return {"active_slot": active_slot, "serial": serial, "model_id": None, "version_a": version_a, "version_b": version_b}
     version_a = payload[1 : 1 + FW_VERSION_LEN].rstrip(b"\x00").decode("utf-8", errors="replace")
     version_b = payload[1 + FW_VERSION_LEN : 1 + FW_VERSION_LEN * 2].rstrip(b"\x00").decode("utf-8", errors="replace")
-    return {"active_slot": active_slot, "version_a": version_a, "version_b": version_b}
+    return {"active_slot": active_slot, "serial": None, "model_id": None, "version_a": version_a, "version_b": version_b}
 
 
 # I2C Scan

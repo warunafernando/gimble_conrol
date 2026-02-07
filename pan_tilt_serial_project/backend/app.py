@@ -1,9 +1,12 @@
 """
 PC backend: serial bridge to ESP32 (binary protocol), WebSocket push to web GUI.
-Debug: last N log lines and connection status in debug panel.
+On startup: scan COM ports, open each and probe for gimbal model 99; keep first match.
+Every 30s: if connected, send GET_FW_INFO and expect response; disconnect if no reply.
 """
 
 import os
+import platform
+import re
 import threading
 import time
 from queue import Queue, Full
@@ -12,6 +15,14 @@ from flask import Flask, Response, request, send_from_directory
 from flask_socketio import SocketIO, emit
 
 from typing import Optional, Tuple
+
+import serial
+
+
+def _com_port_sort_key(port: str) -> Tuple[int, str]:
+    """Sort COM ports numerically: COM3, COM4, COM5, COM9, COM13 (not COM13 before COM3)."""
+    m = re.match(r"^COM(\d+)$", (port or "").upper())
+    return (int(m.group(1)), port) if m else (99999, port)
 
 # All socketio.emit from serial thread are queued; single thread drains and emits (avoids crash)
 _emit_queue = Queue(maxsize=400)
@@ -30,11 +41,15 @@ except (ImportError, Exception):
 import serial.tools.list_ports
 from serial_bridge import DebugLog, SerialBridge
 from protocol import (
+    build_frame,
+    parse_frame,
     CMD_GET_FW_INFO,
     CMD_I2C_SCAN,
     RSP_ACK_EXECUTED,
+    RSP_ACK_RECEIVED,
     RSP_FW_INFO,
     RSP_I2C_SCAN,
+    STX,
     decode_fw_info,
     decode_i2c_scan,
     decode_imu,
@@ -47,10 +62,28 @@ app = Flask(__name__, static_folder="static", static_url_path="")
 app.config["SECRET_KEY"] = "gimbal-backend"
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
+GIMBAL_MODEL_TARGET = 99
+PROBE_TIMEOUT = 2.0
+PROBE_SETTLE_AFTER_CLOSE = 1.5
+KEEPALIVE_INTERVAL = 30.0
+KEEPALIVE_PONG_TIMEOUT = 5.0
+
 debug_log = DebugLog(max_lines=500)
 bridge: Optional[SerialBridge] = None
 _seq = 0
-_state = {"connected": False, "port": "", "last_move": None, "last_imu": None, "last_imu2": None, "last_ina": None, "last_gimbal_state": None, "fw_info": None}
+_state = {
+    "connected": False,
+    "port": "",
+    "gimbal_serial": None,
+    "last_move": None,
+    "last_imu": None,
+    "last_imu2": None,
+    "last_ina": None,
+    "last_gimbal_state": None,
+    "fw_info": None,
+    "ping_sent_at": None,
+}
+_scan_requested = threading.Event()
 # Rate-limit IMU frame emits so fast reads don't overwhelm server (min interval in seconds)
 _imu_emit_interval = 0.05  # 50 ms
 _last_imu_emit_time = 0.0
@@ -68,6 +101,208 @@ def next_seq() -> int:
     global _seq
     _seq = (_seq + 1) & 0xFFFF
     return _seq
+
+
+def _serial_port_name(port: str) -> str:
+    """On Windows use \\\\.\\COMn for reliable open."""
+    port = (port or "").strip()
+    if not port:
+        return port
+    if platform.system() == "Windows":
+        pu = port.upper()
+        if pu.startswith("COM") and not pu.startswith("\\\\"):
+            return "\\\\.\\" + pu
+    return port
+
+
+def probe_port_for_gimbal(port: str, baud: int = 921600) -> Tuple[Optional[dict], Optional[serial.Serial]]:
+    """Open port, send GET_FW_INFO, read until RSP_FW_INFO or timeout.
+    If model_id==99: return (fw_dict, open_serial) and do NOT close the port.
+    Else: return (None, None) and close the port."""
+    port_to_use = _serial_port_name(port)
+    if not port_to_use:
+        return None, None
+    ser = None
+    try:
+        ser = serial.Serial(port_to_use, baud, timeout=0.05)
+        ser.reset_input_buffer()
+        frame = build_frame(1, CMD_GET_FW_INFO, b"")
+        ser.write(frame)
+        deadline = time.monotonic() + PROBE_TIMEOUT
+        buf = bytearray()
+        while time.monotonic() < deadline:
+            buf.extend(ser.read(256))
+            if len(buf) < 8:
+                time.sleep(0.02)
+                continue
+            try:
+                idx = buf.index(STX)
+            except ValueError:
+                buf.clear()
+                continue
+            if idx > 0:
+                del buf[:idx]
+            length = buf[1]
+            if length < 4 or length > 251:
+                buf.pop(0)
+                continue
+            frame_size = 4 + length
+            if len(buf) < frame_size:
+                time.sleep(0.02)
+                continue
+            frame_bytes = bytes(buf[:frame_size])
+            del buf[:frame_size]
+            result = parse_frame(frame_bytes)
+            if result is None:
+                continue
+            _seq, type_id, payload = result
+            if type_id == RSP_ACK_RECEIVED:
+                continue
+            if type_id == RSP_FW_INFO:
+                fw = decode_fw_info(payload)
+                if fw:
+                    if fw.get("model_id") == GIMBAL_MODEL_TARGET:
+                        open_ser = ser
+                        ser = None
+                        return (fw, open_ser)
+                    debug_log.append(f"Probe {port}: model_id={fw.get('model_id')} (need {GIMBAL_MODEL_TARGET}), skip")
+                return None, None
+    except (OSError, serial.SerialException) as e:
+        debug_log.append(f"Probe {port}: {e}")
+        return None, None
+    finally:
+        if ser and ser.is_open:
+            try:
+                ser.close()
+            except Exception:
+                pass
+        if ser:
+            time.sleep(0.1)
+    debug_log.append(f"Probe {port}: no FW_INFO in {PROBE_TIMEOUT}s")
+    return None, None
+
+
+def _probe_one(port: str, result_queue: "Queue", done_count: list) -> None:
+    """Probe one port and put (port, fw, ser) on result_queue. done_count[0] += 1 when finished."""
+    try:
+        fw, open_ser = probe_port_for_gimbal(port)
+        result_queue.put((port, fw, open_ser))
+    except Exception as e:
+        debug_log.append(f"Probe {port} thread: {e}")
+        result_queue.put((port, None, None))
+    finally:
+        done_count[0] += 1
+
+
+def _auto_connect_worker() -> None:
+    """Background: list COM ports, probe all in parallel; use first gimbal (model 99) and keep its port open."""
+    time.sleep(1.0)
+    debug_log.append("Auto-connect: started")
+    while True:
+        try:
+            if bridge and _state.get("connected"):
+                _scan_requested.clear()
+                _scan_requested.wait(timeout=30.0)
+                continue
+            ports = sorted([p.device for p in serial.tools.list_ports.comports()], key=_com_port_sort_key)
+            if not ports:
+                debug_log.append("Auto-connect: no COM ports found")
+                _scan_requested.clear()
+                _scan_requested.wait(timeout=5.0)
+                continue
+            debug_log.append(f"Auto-connect: scanning {ports} (parallel)")
+            result_queue = Queue()
+            done_count = [0]
+            for port in ports:
+                t = threading.Thread(target=_probe_one, args=(port, result_queue, done_count), daemon=True)
+                t.start()
+            chosen_port = None
+            chosen_fw = None
+            chosen_ser = None
+            n = len(ports)
+
+            def drain_rest(remaining: int) -> None:
+                for _ in range(remaining):
+                    try:
+                        port, fw, open_ser = result_queue.get(timeout=3.0)
+                        if open_ser and open_ser.is_open:
+                            try:
+                                open_ser.close()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+            consumed = 0
+            while consumed < n:
+                try:
+                    port, fw, open_ser = result_queue.get(timeout=1.0)
+                    consumed += 1
+                    if chosen_port is None and fw and open_ser:
+                        chosen_port, chosen_fw, chosen_ser = port, fw, open_ser
+                        debug_log.append(f"Auto-connect: {port} is gimbal model 99 serial={fw.get('serial')}, keeping port open")
+                        threading.Thread(target=drain_rest, args=(n - consumed,), daemon=True).start()
+                        break
+                    elif open_ser and open_ser.is_open:
+                        try:
+                            open_ser.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            if chosen_port is None:
+                drain_rest(n - consumed)
+            if chosen_port and chosen_fw and chosen_ser:
+                ok, err = run_bridge(chosen_port, existing_serial=chosen_ser)
+                if ok:
+                    _state["gimbal_serial"] = chosen_fw.get("serial")
+                    try:
+                        _emit_queue.put_nowait(("state", dict(_state)))
+                    except Full:
+                        pass
+                    debug_log.append(f"Auto-connect: connected to {chosen_port} gimbal id {_state['gimbal_serial']}")
+                else:
+                    debug_log.append(f"Auto-connect: run_bridge({chosen_port}) failed: {err}")
+                    try:
+                        chosen_ser.close()
+                    except Exception:
+                        pass
+            _scan_requested.clear()
+            _scan_requested.wait(timeout=5.0)
+        except Exception as e:
+            debug_log.append(f"Auto-connect error: {e}")
+            _scan_requested.wait(timeout=5.0)
+
+
+def _keepalive_worker() -> None:
+    """Every KEEPALIVE_INTERVAL seconds, if connected, send GET_FW_INFO; if no pong in time, disconnect."""
+    global bridge
+    while True:
+        time.sleep(KEEPALIVE_INTERVAL)
+        if not _state.get("connected") or not bridge:
+            continue
+        try:
+            _state["ping_sent_at"] = time.monotonic()
+            bridge.send_command(next_seq(), CMD_GET_FW_INFO, b"")
+        except Exception:
+            pass
+        time.sleep(KEEPALIVE_PONG_TIMEOUT)
+        if not _state.get("connected"):
+            continue
+        if _state.get("ping_sent_at") is not None:
+            debug_log.append("Keepalive: no response, disconnecting")
+            if bridge:
+                bridge.stop()
+                bridge = None
+            _state["connected"] = False
+            _state["port"] = ""
+            _state["gimbal_serial"] = None
+            _state["fw_info"] = None
+            _state["ping_sent_at"] = None
+            try:
+                _emit_queue.put_nowait(("state", dict(_state)))
+            except Full:
+                pass
 
 
 def on_frame(seq: int, type_id: int, payload: bytes) -> None:
@@ -115,10 +350,15 @@ def on_frame(seq: int, type_id: int, payload: bytes) -> None:
             _state["last_gimbal_state"] = gs
             data["payload"] = gs
         elif type_id == RSP_FW_INFO:
+            _state["ping_sent_at"] = None
+            debug_log.append(f"FW_INFO payload len={len(payload)} (69=serial, 70=serial+model_id)")
             fw = decode_fw_info(payload)
             if fw:
-                _state["fw_info"] = fw
-                data["payload"] = fw
+                fw["_payload_len"] = len(payload)
+                debug_log.append(f"FW_INFO decoded serial={fw.get('serial')!r} model_id={fw.get('model_id')!r} version_a={fw.get('version_a')!r}")
+                _state["fw_info"] = dict(fw)
+                _state["gimbal_serial"] = fw.get("serial")
+                data["payload"] = dict(fw)
         elif type_id == RSP_I2C_SCAN:
             i2c = decode_i2c_scan(payload)
             if i2c:
@@ -180,11 +420,13 @@ def _emit_worker() -> None:
                         socketio.emit("fw_info", data["payload"])
                     elif type_id == RSP_I2C_SCAN and data.get("payload"):
                         socketio.emit("i2c_scan", data["payload"])
+                elif kind == "state":
+                    socketio.emit("state", payload)
         except Exception as e:
             debug_log.append(f"emit_worker error: {e}")
 
 
-def run_bridge(port: str, baud: int = 921600) -> Tuple[bool, Optional[str]]:
+def run_bridge(port: str, baud: int = 921600, existing_serial: Optional[serial.Serial] = None) -> Tuple[bool, Optional[str]]:
     global bridge
     if bridge:
         bridge.stop()
@@ -196,28 +438,68 @@ def run_bridge(port: str, baud: int = 921600) -> Tuple[bool, Optional[str]]:
         on_log=_on_log,
         debug_log=debug_log,
     )
-    ok, err_msg = bridge.start()
+    ok, err_msg = bridge.start(existing_serial=existing_serial)
     if ok:
         _state["connected"] = True
         _state["port"] = port
         _state["fw_info"] = None
-        socketio.emit("state", _state)
+        _state["ping_sent_at"] = None
+        try:
+            _emit_queue.put_nowait(("state", dict(_state)))
+        except Full:
+            pass
         bridge.send_command(next_seq(), CMD_GET_FW_INFO, b"")
         return True, None
     _state["connected"] = False
     _state["port"] = ""
-    socketio.emit("state", _state)
+    _state["gimbal_serial"] = None
+    try:
+        _emit_queue.put_nowait(("state", dict(_state)))
+    except Full:
+        pass
     return False, err_msg
 
 
 @app.route("/api/serial_ports")
 def api_serial_ports():
-    """List available serial port names (e.g. COM9) for GUI connection."""
+    """List available serial port names (e.g. COM9)."""
     try:
         ports = [p.device for p in serial.tools.list_ports.comports()]
         return {"ok": True, "ports": sorted(ports)}
     except Exception as e:
         return {"ok": False, "error": str(e), "ports": []}
+
+
+@app.route("/api/rescan_serial", methods=["POST"])
+def api_rescan_serial():
+    """Request a rescan for gimbal on COM ports (if currently disconnected)."""
+    if _state.get("connected"):
+        return {"ok": True, "message": "Already connected", "port": _state.get("port")}
+    _scan_requested.set()
+    return {"ok": True, "message": "Rescan requested"}
+
+
+@app.route("/api/fw_info")
+def api_fw_info():
+    """Return current FW info from device (version, serial, slots). Request is sent on connect; call Get FW Info (610) to refresh."""
+    fw = _state.get("fw_info")
+    if not fw:
+        return {"ok": True, "fw_info": None, "message": "Not yet received. Connect serial and use Get FW Info (610) to fetch."}
+    va = (fw.get("version_a") or "").strip() or None
+    vb = (fw.get("version_b") or "").strip() or None
+    active = fw.get("active_slot", 0)
+    version = va if active == 0 else vb
+    return {
+        "ok": True,
+        "fw_info": {
+            "version": version,
+            "version_a": va,
+            "version_b": vb,
+            "active_slot": active,
+            "serial": fw.get("serial"),
+            "model_id": fw.get("model_id"),
+        },
+    }
 
 
 @app.route("/")
@@ -407,7 +689,13 @@ def on_disconnect_serial():
             bridge = None
         _state["connected"] = False
         _state["port"] = ""
-        socketio.emit("state", _state)
+        _state["gimbal_serial"] = None
+        _state["fw_info"] = None
+        _state["ping_sent_at"] = None
+        try:
+            _emit_queue.put_nowait(("state", dict(_state)))
+        except Full:
+            pass
     except Exception as e:
         debug_log.append(f"disconnect_serial error: {e}")
 
@@ -477,19 +765,18 @@ def tag_emitter():
 
 if __name__ == "__main__":
     import sys
-    # Camera index: --camera N or CAMERA_INDEX env (default 0)
     if "--camera" in sys.argv:
         i = sys.argv.index("--camera")
         if i + 1 < len(sys.argv):
             CAMERA_INDEX = int(sys.argv[i + 1])
     else:
         CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "0"))
-    port_arg = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else None
-    if port_arg:
-        run_bridge(port_arg)
-    # Single thread for all socketio.emit (serial thread only queues; avoids crash on rapid IMU)
     emit_thread = threading.Thread(target=_emit_worker, daemon=True)
     emit_thread.start()
+    auto_connect_thread = threading.Thread(target=_auto_connect_worker, daemon=True)
+    auto_connect_thread.start()
+    keepalive_thread = threading.Thread(target=_keepalive_worker, daemon=True)
+    keepalive_thread.start()
     if CAMERA_AVAILABLE:
         tag_thread = threading.Thread(target=tag_emitter, daemon=True)
         tag_thread.start()

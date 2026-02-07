@@ -9,6 +9,7 @@
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 #include <esp_system.h>
+#include <Preferences.h>
 
 // ----------------------------- Config -----------------------------
 static const uint32_t SERIAL_BAUD = 921600;
@@ -113,6 +114,9 @@ static const uint16_t RSP_OTA_NACK = 2603;
 static const uint16_t RSP_FW_INFO = 2610;
 
 static const size_t FW_VERSION_LEN = 32;  // Max version string length in payload
+static const uint8_t GIMBAL_MODEL_ID = 99;   // Same for all gimbals of this type (product ID)
+static const uint32_t GIMBAL_SERIAL_DEFAULT = 1;  // Unique per unit; this one defaults to 1
+static uint32_t gimbalSerialNumber = GIMBAL_SERIAL_DEFAULT;
 
 // OTA hash types
 static const uint8_t OTA_HASH_NONE = 0;
@@ -963,8 +967,10 @@ static void getPartitionVersion(const esp_partition_t* part, char* buf, size_t b
   }
 }
 
+#define FW_INFO_PAYLOAD_BYTES 70  // active_slot(1) + serial(4) + model_id(1) + version_a(32) + version_b(32)
+
 static void handleGetFwInfo(uint16_t seq) {
-  uint8_t payload[1 + FW_VERSION_LEN * 2];
+  uint8_t payload[FW_INFO_PAYLOAD_BYTES];
   memset(payload, 0, sizeof(payload));
   
   const esp_partition_t* running = esp_ota_get_running_partition();
@@ -977,6 +983,13 @@ static void handleGetFwInfo(uint16_t seq) {
     else if (partB != nullptr && running->address == partB->address) activeSlot = 1;  // B
   }
   payload[0] = activeSlot;
+  // Serial number (uint32 LE) - unique per unit
+  payload[1] = (uint8_t)(gimbalSerialNumber);
+  payload[2] = (uint8_t)(gimbalSerialNumber >> 8);
+  payload[3] = (uint8_t)(gimbalSerialNumber >> 16);
+  payload[4] = (uint8_t)(gimbalSerialNumber >> 24);
+  // Model ID (1 byte) - same for all gimbals of this product
+  payload[5] = GIMBAL_MODEL_ID;
   
   char versionA[FW_VERSION_LEN];
   char versionB[FW_VERSION_LEN];
@@ -999,10 +1012,10 @@ static void handleGetFwInfo(uint16_t seq) {
     getPartitionVersion(partB, versionB, FW_VERSION_LEN);
   }
   
-  memcpy(&payload[1], versionA, FW_VERSION_LEN);
-  memcpy(&payload[1 + FW_VERSION_LEN], versionB, FW_VERSION_LEN);
+  memcpy(&payload[6], versionA, FW_VERSION_LEN);
+  memcpy(&payload[6 + FW_VERSION_LEN], versionB, FW_VERSION_LEN);
   
-  sendFrame(seq, RSP_FW_INFO, payload, sizeof(payload));
+  sendFrame(seq, RSP_FW_INFO, payload, (size_t)FW_INFO_PAYLOAD_BYTES);
 }
 
 static void handleSwitchFw(uint16_t seq, const uint8_t* payload, size_t payloadLen) {
@@ -1449,6 +1462,21 @@ void setup() {
   imuInit();
   updateImu();
   updateIna219();
+
+  // Gimbal serial number from NVS (default 1 for this unit; persist on first boot)
+  {
+    Preferences prefs;
+    if (prefs.begin("gimbal", true)) {
+      gimbalSerialNumber = prefs.getULong("sn", GIMBAL_SERIAL_DEFAULT);
+      bool hasKey = prefs.isKey("sn");
+      prefs.end();
+      if (!hasKey) {
+        prefs.begin("gimbal", false);
+        prefs.putULong("sn", gimbalSerialNumber);
+        prefs.end();
+      }
+    }
+  }
 
   // Don't lock servos at startup - just enable torque to hold position
   // This avoids reading/writing positions which could cause unwanted movement
