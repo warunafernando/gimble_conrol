@@ -10,7 +10,7 @@ Firmware and PC tools for the Waveshare ESP32-based pan-tilt gimbal: serial prot
 
 The original firmware provided the base pan-tilt and serial interface.
 
-![Original firmware](docs/Original.png)
+![Original firmware](https://raw.githubusercontent.com/warunafernando/gimble_conrol/main/pan_tilt_serial_project/docs/Original.png)
 
 *Original FW — baseline functionality.*
 
@@ -20,7 +20,7 @@ The original firmware provided the base pan-tilt and serial interface.
 
 The new firmware adds extended features and protocol support used by the web GUI and OTA flow.
 
-![New firmware](docs/New.png)
+![New firmware](https://raw.githubusercontent.com/warunafernando/gimble_conrol/main/pan_tilt_serial_project/docs/New.png)
 
 *New FW — serial protocol (FW info with model ID & serial), UART OTA A/B, and compatibility with the auto-connect web GUI.*
 
