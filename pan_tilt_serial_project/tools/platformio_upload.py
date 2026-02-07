@@ -35,6 +35,8 @@ def upload_with_waveshare(source, target, env):
         "-p", port,
         "--build-dir", build_dir
     ]
+    if env.GetProjectOption("upload_swap_dtr_rts", "0") == "1":
+        cmd.append("--swap-dtr-rts")
     
     print("=" * 60)
     print("Using Waveshare-Compatible Uploader")

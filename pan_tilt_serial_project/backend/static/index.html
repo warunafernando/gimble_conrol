@@ -113,6 +113,48 @@
     .state-lock-col { flex: 0 0 auto; }
     .state-lock-col h2 { margin: 0 0 8px 0; }
     .state-lock-col .btn-row { flex-direction: column; align-items: stretch; }
+    .camera-panel { flex: 1; min-width: 320px; max-width: 40%; }
+    .camera-wrap { background: #0d0d10; border-radius: 6px; overflow: hidden; max-height: 320px; }
+    .camera-wrap img { display: block; width: 100%; max-height: 300px; object-fit: contain; }
+    .camera-scan-panel { min-width: 220px; max-width: 280px; }
+    .camera-scan-result { font-size: 0.8rem; margin-bottom: 8px; min-height: 2em; }
+    .camera-list { display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow-y: auto; }
+    .camera-list .cam-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; background: #25252d; padding: 8px 10px; border-radius: 4px; font-size: 0.85rem; }
+    .camera-list .cam-item .cam-label { color: var(--text); flex: 1; min-width: 0; line-height: 1.3; }
+    .camera-list .cam-item.current { border: 1px solid var(--ok); }
+    .apriltag-panel { min-width: 200px; max-width: 250px; }
+    .apriltag-list { font-family: 'Consolas', monospace; font-size: 0.85rem; max-height: 280px; overflow-y: auto; }
+    .apriltag-item { background: #25252d; border-radius: 4px; padding: 8px 10px; margin-bottom: 6px; }
+    .apriltag-item .tag-id { color: var(--accent); font-weight: bold; font-size: 1rem; }
+    .apriltag-item .tag-pos { color: #a8e6cf; font-size: 0.8rem; margin-top: 4px; }
+    .heading-gauge {
+      width: 140px;
+      height: 140px;
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .heading-gauge svg {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+    .heading-gauge .needle {
+      transform-origin: 0 0;
+      transition: transform 0.08s ease-out;
+    }
+    .heading-gauge .needle line {
+      stroke: var(--accent);
+      stroke-width: 2.5;
+    }
+    .heading-gauge .yaw-value {
+      text-align: center;
+      font-family: 'Consolas', monospace;
+      font-size: 0.9rem;
+      color: var(--accent);
+      margin-top: 4px;
+    }
   </style>
 </head>
 <body>
@@ -136,7 +178,9 @@
         <span id="connStatus">Disconnected</span>
       </div>
       <div class="controls" style="margin-top:10px">
-        <input type="text" id="port" value="COM9" placeholder="Port" />
+        <label>Port: <select id="portSelect"><option value="COM9">COM9</option></select></label>
+        <button id="btnRefreshPorts" type="button" title="Scan for COM ports">Refresh ports</button>
+        <input type="text" id="port" value="COM9" placeholder="Port" style="width:70px;" />
         <input type="text" id="baud" value="921600" placeholder="Baud" />
         <button id="btnConnect">Connect</button>
         <button id="btnDisconnect" class="danger" disabled>Disconnect</button>
@@ -152,6 +196,38 @@
         <button id="cmdGetImu">Get IMU (126)</button>
       </div>
       <pre class="live" id="liveImu">—</pre>
+    </div>
+    <div class="panel">
+      <h2>Gyro / IMU</h2>
+      <pre class="live" id="liveGyro">—</pre>
+      <div class="live" style="font-size:0.8rem; color:#888; margin-top:4px;">Roll/Pitch/Yaw ° · Gyro °/s · used for track direction</div>
+    </div>
+    <div class="panel">
+      <h2>Heading (Yaw)</h2>
+      <div class="heading-gauge">
+        <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="50" cy="50" r="46" fill="none" stroke="var(--border)" stroke-width="2"/>
+          <circle cx="50" cy="50" r="42" fill="var(--panel)" stroke="var(--border)" stroke-width="1"/>
+          <line x1="50" y1="8" x2="50" y2="18" stroke="var(--text)" stroke-width="1.5" opacity="0.9"/>
+          <line x1="50" y1="82" x2="50" y2="92" stroke="var(--text)" stroke-width="1" opacity="0.5"/>
+          <line x1="8" y1="50" x2="18" y2="50" stroke="var(--text)" stroke-width="1" opacity="0.5"/>
+          <line x1="82" y1="50" x2="92" y2="50" stroke="var(--text)" stroke-width="1" opacity="0.5"/>
+          <!-- Fixed center hub (does not rotate) -->
+          <circle cx="50" cy="50" r="5" fill="var(--accent)"/>
+          <!-- Needle: pivot at center via translate(50,50) + rotate -->
+          <g transform="translate(50, 50)">
+            <g class="needle" id="headingNeedle" transform="rotate(0)">
+              <line x1="0" y1="-40" x2="0" y2="40" stroke-linecap="round"/>
+            </g>
+          </g>
+        </svg>
+        <div class="yaw-value" id="yawValue">— °</div>
+        <div style="margin-top:6px;font-size:0.75rem;color:#888;">
+          <label>North offset (deg):</label>
+          <input type="number" id="headingNorthOffset" value="0" min="-180" max="180" step="1" style="width:50px;"/>
+          <span style="font-size:0.7rem;color:#666;">Add when facing North to get 0°</span>
+        </div>
+      </div>
     </div>
     <div class="panel">
       <h2>IMU2 - ICM42688</h2>
@@ -301,10 +377,42 @@
       <div class="debug" id="debugLog"></div>
       <button id="btnRefreshLog" style="margin-top:8px">Refresh log</button>
     </div>
+    <div class="panel camera-scan-panel">
+      <h2>Arducam / Camera</h2>
+      <div class="controls" style="margin-bottom:8px">
+        <button id="btnScanAndOpen">Scan & open (1200p @ 50 fps)</button>
+      </div>
+      <div id="cameraScanResult" class="camera-scan-result" style="font-size:0.85rem; color:#888;">
+        <span id="cameraStatus">Click button to scan and open camera</span>
+      </div>
+      <div class="camera-current" style="margin-top:8px; font-size:0.8rem; color:#888;">
+        Current: <span id="cameraCurrentIndex">—</span>
+      </div>
+    </div>
+    <div class="panel camera-panel">
+      <h2>Live camera</h2>
+      <div class="camera-wrap">
+        <img id="cameraFeed" src="" alt="Camera feed" style="display:none;" />
+        <div id="cameraPlaceholder" style="padding:40px; text-align:center; color:#888;">Click Scan & open or Refresh stream</div>
+      </div>
+      <button id="btnRefreshCam" style="margin-top:8px">Refresh stream</button>
+    </div>
+    <div class="panel apriltag-panel">
+      <h2>AprilTags Detected</h2>
+      <div class="controls" style="margin-bottom:8px">
+        <button id="btnAutoTrack" data-active="false" style="background:#555;">Auto-Track: OFF</button>
+      </div>
+      <div id="apriltagList" class="apriltag-list">
+        <span style="color:#888;">No tags detected</span>
+      </div>
+    </div>
   </div>
 
   <script>
-    const socket = io();
+    var socketUrl = (window.location.origin && window.location.protocol && window.location.protocol.indexOf('http') === 0)
+      ? window.location.origin
+      : 'http://localhost:5000';
+    const socket = io(socketUrl, { transports: ['websocket', 'polling'], reconnection: true, reconnectionAttempts: 20, reconnectionDelay: 2000 });
     const dot = document.getElementById('dot');
     const connStatus = document.getElementById('connStatus');
     const portInput = document.getElementById('port');
@@ -344,12 +452,206 @@
 
     socket.on('state', function (s) {
       setConnected(s.connected);
-      if (s.port) portInput.value = s.port;
+      if (s.port) {
+        portInput.value = s.port;
+        var sel = document.getElementById('portSelect');
+        if (sel && sel.querySelector('option[value="' + s.port + '"]')) sel.value = s.port;
+      }
       if (s.fw_info) updateFwDisplay(s.fw_info);
+      if (s.last_imu && s.last_imu.yaw != null) {
+        lastImu = s.last_imu;
+        updateHeadingNeedle(s.last_imu.yaw);
+      }
     });
     socket.on('fw_info', function (fw) {
       updateFwDisplay(fw || {});
     });
+    // Servo position: raw 0-4095, center 2048 ~ 0 deg. deg = (raw - 2048) * (360/4095)
+    const PAN_CENTER_RAW = 2048;
+    const PAN_RAW_TO_DEG = 360 / 4095;
+    function panRawToDeg(raw) {
+      return (raw - PAN_CENTER_RAW) * PAN_RAW_TO_DEG;
+    }
+
+    // AprilTag auto-tracking state
+    let autoTrackEnabled = false;
+    let scanDirection = 1; // 1 = right, -1 = left
+    let currentPan = 0;
+    let lastPanPosRaw = null;      // from move feedback (int16)
+    let lastPanPosDeg = null;      // converted to degrees for commands
+    let lastTagCenterX = null;     // last known tag X when we had a tag (for recover direction)
+    let lastImu = null;            // last IMU (roll, pitch, yaw, gx, gy, gz) for display and direction
+    const FRAME_WIDTH = 1920;
+    const FRAME_CENTER_X = 960;
+    var effectiveFrameCenterX = 960;  // Updated from /api/cameras/current (width/2) so tag centers correctly
+    const SCAN_SPEED = 800;        // Fast when searching
+    const SCAN_STEP = 8;           // degrees per step when searching
+    const RECOVER_SPEED = 500;     // speed when moving toward lost tag
+    const RECOVER_STEP = 4;        // degrees per step when recovering
+    const CENTER_THRESHOLD = 35;   // pixels from center to consider "centered"
+    const TRACK_SPEED_FAST = 400;  // when tag is far from center
+    const TRACK_SPEED_SLOW = 80;   // when tag is close (avoid oscillation)
+    const TRACK_ZONE = 120;       // pixels: inside this = slow, outside = fast
+    let scanInterval = null;
+    let recoverInterval = null;
+    let recoverDirection = 1;      // 1 = pan right, -1 = pan left
+
+    socket.on('apriltags', function (data) {
+      const list = document.getElementById('apriltagList');
+      const tags = data.tags || [];
+      if (tags.length === 0) {
+        list.innerHTML = '<span style="color:#888;">No tags detected</span>';
+      } else {
+        list.innerHTML = tags.map(function(t) {
+          return '<div class="apriltag-item">' +
+            '<div class="tag-id">Tag #' + t.id + '</div>' +
+            '<div class="tag-pos">Center: (' + t.center_x + ', ' + t.center_y + ')</div>' +
+            '</div>';
+        }).join('');
+      }
+
+      // Auto-tracking logic
+      if (autoTrackEnabled) {
+        // Check if serial is connected before sending commands
+        const connected = dot.classList.contains('connected');
+        if (!connected) {
+          // Disable auto-track if connection lost
+          autoTrackEnabled = false;
+          const btn = document.getElementById('btnAutoTrack');
+          btn.setAttribute('data-active', 'false');
+          btn.textContent = 'Auto-Track: OFF';
+          btn.style.background = '#555';
+          if (scanInterval) {
+            clearInterval(scanInterval);
+            scanInterval = null;
+          }
+          if (recoverInterval) {
+            clearInterval(recoverInterval);
+            recoverInterval = null;
+          }
+          return;
+        }
+        
+        if (tags.length > 0) {
+          // Tag found - remember position and keep centered
+          const tag = tags[0];
+          lastTagCenterX = tag.center_x;
+          if (recoverInterval) {
+            clearInterval(recoverInterval);
+            recoverInterval = null;
+          }
+
+          const centerX = effectiveFrameCenterX;
+          const offsetX = tag.center_x - centerX;
+          const absOffset = Math.abs(offsetX);
+
+          if (absOffset > CENTER_THRESHOLD) {
+            // Tag not centered - speed and step depend on distance
+            const inSlowZone = absOffset < TRACK_ZONE;
+            const panStep = inSlowZone ? 0.4 : 2;
+            const speed = inSlowZone ? TRACK_SPEED_SLOW : TRACK_SPEED_FAST;
+            currentPan += offsetX > 0 ? panStep : -panStep;
+            currentPan = Math.max(-180, Math.min(180, currentPan));
+            if (scanInterval) {
+              clearInterval(scanInterval);
+              scanInterval = null;
+            }
+            sendCommand(172, floatToBytes(currentPan).concat(u16ToBytes(speed), u16ToBytes(50)));
+          } else {
+            // Centered - stop
+            if (scanInterval) {
+              clearInterval(scanInterval);
+              scanInterval = null;
+            }
+            sendCommand(135, []);
+          }
+        } else {
+          // No tag - move toward where we lost it: use actual pan from feedback + tag position
+          if (lastTagCenterX !== null) {
+            // Use actual gimbal position so we step from reality (fixes wrong-way when currentPan drifted)
+            if (lastPanPosDeg != null) {
+              currentPan = lastPanPosDeg;
+            }
+            // Shortest way: tag left of center → it exited left → pan left (decrease). Tag right → pan right (increase).
+            recoverDirection = lastTagCenterX < effectiveFrameCenterX ? -1 : 1;
+            startRecoverInterval();
+          } else {
+            startScanInterval();
+          }
+        }
+      }
+    });
+
+    // Start scanning (used when auto-track ON, no tag, never had tag)
+    function startScanInterval() {
+      if (scanInterval) return;
+      if (recoverInterval) {
+        clearInterval(recoverInterval);
+        recoverInterval = null;
+      }
+      scanInterval = setInterval(function() {
+        const connected = dot.classList.contains('connected');
+        if (!connected) return;
+        currentPan += SCAN_STEP * scanDirection;
+        if (currentPan >= 180 || currentPan <= -180) {
+          scanDirection *= -1;
+          currentPan = Math.max(-180, Math.min(180, currentPan));
+        }
+        sendCommand(172, floatToBytes(currentPan).concat(u16ToBytes(SCAN_SPEED), u16ToBytes(50)));
+      }, 300);
+    }
+
+    // Move toward where tag was lost (shortest way), using actual pan from feedback
+    function startRecoverInterval() {
+      if (recoverInterval) return;
+      if (scanInterval) {
+        clearInterval(scanInterval);
+        scanInterval = null;
+      }
+      recoverInterval = setInterval(function() {
+        const connected = dot.classList.contains('connected');
+        if (!connected) return;
+        if (lastPanPosDeg != null) currentPan = lastPanPosDeg;
+        currentPan += RECOVER_STEP * recoverDirection;
+        currentPan = Math.max(-180, Math.min(180, currentPan));
+        if (currentPan >= 180 || currentPan <= -180) {
+          recoverDirection *= -1;
+        }
+        sendCommand(172, floatToBytes(currentPan).concat(u16ToBytes(RECOVER_SPEED), u16ToBytes(50)));
+      }, 200);
+    }
+
+    // Auto-track toggle button
+    document.getElementById('btnAutoTrack').onclick = function() {
+      // Check if serial is connected
+      const connected = dot.classList.contains('connected');
+      if (!connected) {
+        alert('Please connect to serial port (COM9) first');
+        return;
+      }
+      
+      autoTrackEnabled = !autoTrackEnabled;
+      const btn = document.getElementById('btnAutoTrack');
+      btn.setAttribute('data-active', autoTrackEnabled);
+      btn.textContent = autoTrackEnabled ? 'Auto-Track: ON' : 'Auto-Track: OFF';
+      btn.style.background = autoTrackEnabled ? 'var(--ok)' : '#555';
+      
+      if (!autoTrackEnabled) {
+        if (scanInterval) {
+          clearInterval(scanInterval);
+          scanInterval = null;
+        }
+        if (recoverInterval) {
+          clearInterval(recoverInterval);
+          recoverInterval = null;
+        }
+        sendCommand(135, []);
+      } else {
+        // Turned ON: start scanning immediately (don't wait for apriltags event)
+        startScanInterval();
+      }
+    };
+
     socket.on('i2c_scan', function (data) {
       document.getElementById('i2cCount').textContent = data.count || 0;
       const addrDiv = document.getElementById('i2cAddresses');
@@ -382,10 +684,27 @@
       if (data.payload) {
         if (data.type === 2 && data.payload.pan_pos !== undefined) {
           const p = data.payload;
-          liveMove.textContent = `pan_pos ${p.pan_pos}  pan_load ${p.pan_load}\ntilt_pos ${p.tilt_pos}  tilt_load ${p.tilt_load}`;
+          lastPanPosRaw = p.pan_pos;
+          lastPanPosDeg = panRawToDeg(p.pan_pos);
+          currentPan = lastPanPosDeg;  // keep commanded pan in sync with actual for recovery
+          let moveText = `pan_pos ${p.pan_pos}  pan_load ${p.pan_load}\ntilt_pos ${p.tilt_pos}  tilt_load ${p.tilt_load}`;
+          if (lastImu != null && (lastImu.gx != null || lastImu.gy != null || lastImu.gz != null)) {
+            const gx = lastImu.gx != null ? lastImu.gx.toFixed(1) : '—';
+            const gy = lastImu.gy != null ? lastImu.gy.toFixed(1) : '—';
+            const gz = lastImu.gz != null ? lastImu.gz.toFixed(1) : '—';
+            moveText += '\nGyro gx ' + gx + '  gy ' + gy + '  gz ' + gz + ' °/s';
+          }
+          liveMove.textContent = moveText;
         } else if (data.type === 1002) {
           const i = data.payload;
+          lastImu = i;
           liveImu.textContent = `r ${(i.roll||0).toFixed(2)}  p ${(i.pitch||0).toFixed(2)}  y ${(i.yaw||0).toFixed(2)}`;
+          const gyroEl = document.getElementById('liveGyro');
+          if (gyroEl) {
+            gyroEl.textContent = 'Roll ' + (i.roll != null ? i.roll.toFixed(2) : '—') + '°  Pitch ' + (i.pitch != null ? i.pitch.toFixed(2) : '—') + '°  Yaw ' + (i.yaw != null ? i.yaw.toFixed(2) : '—') + '°\n' +
+              'Gyro gx ' + (i.gx != null ? i.gx.toFixed(1) : '—') + '  gy ' + (i.gy != null ? i.gy.toFixed(1) : '—') + '  gz ' + (i.gz != null ? i.gz.toFixed(1) : '—') + ' °/s';
+          }
+          updateHeadingNeedle(i.yaw);
         } else if (data.type === 1003) {
           const i = data.payload;
           const el = document.getElementById('liveImu2');
@@ -424,12 +743,64 @@
       debugLog.innerHTML = (data.lines || []).map(l => `<div class="line">${escapeHtml(l)}</div>`).join('');
       debugLog.scrollTop = debugLog.scrollHeight;
     });
+    socket.on('connect', function () {
+      connStatus.textContent = 'Disconnected';
+      dot.classList.remove('connected');
+    });
+    socket.on('disconnect', function (reason) {
+      connStatus.textContent = 'Server disconnected. Reconnecting…';
+      dot.classList.remove('connected');
+      btnConnect.disabled = false;
+    });
+    socket.on('connect_error', function (err) {
+      connStatus.textContent = 'Cannot reach server';
+      dot.classList.remove('connected');
+      btnConnect.disabled = false;
+      console.error('Socket connect_error:', err.message);
+    });
+    var connectTimeoutId = null;
     socket.on('connect_serial_result', function (data) {
+      if (connectTimeoutId) { clearTimeout(connectTimeoutId); connectTimeoutId = null; }
+      btnConnect.disabled = false;
+      connStatus.textContent = data.ok ? 'Connected' : 'Disconnected';
       setConnected(data.ok);
-      if (!data.ok) alert('Failed to connect to ' + data.port);
+      if (!data.ok) alert('Failed to connect to ' + (data.port || '') + (data.error ? '\n' + data.error : ''));
     });
     socket.on('error', function (data) { alert(data.msg || 'Error'); });
 
+    let lastHeadingYaw = null;
+    let lastUnwrappedDisplay = null;
+    function updateHeadingNeedle(yawDeg) {
+      const needle = document.getElementById('headingNeedle');
+      const yawEl = document.getElementById('yawValue');
+      if (!needle || !yawEl) return;
+      if (yawDeg == null || Number.isNaN(yawDeg)) {
+        lastHeadingYaw = null;
+        lastUnwrappedDisplay = null;
+        yawEl.textContent = '— °';
+        needle.setAttribute('transform', 'rotate(0)');
+        return;
+      }
+      var displayAngle;
+      if (lastHeadingYaw == null) {
+        displayAngle = yawDeg;
+      } else {
+        var delta = yawDeg - lastHeadingYaw;
+        if (delta > 180) delta -= 360;
+        if (delta < -180) delta += 360;
+        displayAngle = lastUnwrappedDisplay + delta;
+      }
+      lastHeadingYaw = yawDeg;
+      lastUnwrappedDisplay = displayAngle;
+      var northOffset = parseFloat(document.getElementById('headingNorthOffset').value) || 0;
+      var displayCorrected = displayAngle + 180 + northOffset;  // sensor +180 + North offset
+      needle.setAttribute('transform', 'rotate(' + displayCorrected + ')');
+      var showVal = (((displayCorrected % 360) + 360) % 360);
+      yawEl.textContent = showVal.toFixed(1) + ' °';
+    }
+    document.getElementById('headingNorthOffset').oninput = function() {
+      if (lastHeadingYaw != null) updateHeadingNeedle(lastHeadingYaw);
+    };
     function updateFwDisplay(fw) {
       const va = (fw.version_a || '').trim() || '—';
       const vb = (fw.version_b || '').trim() || '—';
@@ -450,11 +821,157 @@
       return d.innerHTML;
     }
 
+    function refreshSerialPorts() {
+      fetch('/api/serial_ports')
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          var sel = document.getElementById('portSelect');
+          if (!sel) return;
+          var current = sel.value || portInput.value.trim() || 'COM9';
+          sel.innerHTML = (d.ports && d.ports.length) ? d.ports.map(function(p) { return '<option value="' + p + '">' + p + '</option>'; }).join('') : '<option value="COM9">COM9</option>';
+          if (sel.querySelector('option[value="' + current + '"]')) sel.value = current;
+          else if (d.ports && d.ports.length) sel.selectedIndex = 0;
+          portInput.value = sel.value;
+        })
+        .catch(function() {});
+    }
+    var portSelectEl = document.getElementById('portSelect');
+    if (portSelectEl) portSelectEl.onchange = function() { if (portInput) portInput.value = this.value; };
+    document.getElementById('btnRefreshPorts').onclick = refreshSerialPorts;
+    refreshSerialPorts();
     btnConnect.onclick = function () {
-      socket.emit('connect_serial', { port: portInput.value.trim(), baud: parseInt(baudInput.value, 10) || 921600 });
+      if (!socket.connected) {
+        alert('Not connected to server. Refresh the page (F5) and try again.');
+        return;
+      }
+      var sel = document.getElementById('portSelect');
+      var port = (sel && sel.value) ? String(sel.value).trim() : (portInput ? portInput.value : '');
+      port = port || 'COM9';
+      var baud = parseInt(baudInput.value, 10) || 921600;
+      connStatus.textContent = 'Connecting to ' + port + '...';
+      btnConnect.disabled = true;
+      if (connectTimeoutId) clearTimeout(connectTimeoutId);
+      connectTimeoutId = setTimeout(function() {
+        connectTimeoutId = null;
+        btnConnect.disabled = false;
+        if (connStatus.textContent.indexOf('Connecting') === 0) {
+          connStatus.textContent = 'Disconnected';
+          alert('No response from server. Is the backend running?');
+        }
+      }, 15000);
+      socket.emit('connect_serial', { port: port, baud: baud });
     };
     btnDisconnect.onclick = function () { socket.emit('disconnect_serial'); };
     btnRefreshLog.onclick = function () { socket.emit('get_log'); };
+
+    // Camera: one button = scan + open 1200p @ 50 fps + start stream
+    var CAMERA_1200P = { width: 1920, height: 1200, fps: 50 };
+    function refreshCameraCurrent() {
+      fetch('/api/cameras/current')
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          var el = document.getElementById('cameraCurrentIndex');
+          if (el) el.textContent = d.ok ? ('Index ' + d.index + ', ' + (d.width || 1920) + '×' + (d.height || 1200) + ' @ ' + (d.fps != null ? d.fps : 50) + ' fps') : '—';
+          if (d.ok && d.width != null && d.width > 0) effectiveFrameCenterX = d.width / 2;
+        })
+        .catch(function() {
+          var el = document.getElementById('cameraCurrentIndex');
+          if (el) el.textContent = '—';
+        });
+    }
+    function startCameraFeed() {
+      var img = document.getElementById('cameraFeed');
+      var placeholder = document.getElementById('cameraPlaceholder');
+      placeholder.textContent = 'Loading camera...';
+      placeholder.style.display = 'block';
+      img.style.display = 'none';
+      fetch('/api/cameras/current')
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          var idx = (d.ok && d.index != null) ? d.index : 0;
+          return fetch('/api/cameras/select', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ index: idx, width: CAMERA_1200P.width, height: CAMERA_1200P.height, fps: CAMERA_1200P.fps })
+          });
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(res) {
+          if (res && res.ok) refreshCameraCurrent();
+        })
+        .catch(function() {})
+        .finally(function() {
+          img.src = '/video_feed?' + Date.now();
+        });
+      img.onload = function() {
+        img.style.display = 'block';
+        placeholder.style.display = 'none';
+      };
+      img.onerror = function() {
+        placeholder.textContent = 'Camera not available - try Scan & open';
+        placeholder.style.display = 'block';
+        img.style.display = 'none';
+      };
+      setTimeout(function() {
+        if (img.style.display === 'none' && img.src) {
+          placeholder.textContent = 'Still loading… If no picture, try Refresh stream';
+        }
+      }, 8000);
+      setTimeout(function() {
+        if (img.style.display === 'none' && img.src) {
+          img.style.display = 'block';
+          placeholder.style.display = 'none';
+        }
+      }, 20000);
+    }
+    document.getElementById('btnScanAndOpen').onclick = function() {
+      var statusEl = document.getElementById('cameraStatus');
+      statusEl.textContent = 'Scanning...';
+      fetch('/api/cameras')
+        .then(function(r) {
+          if (!r.ok) {
+            return r.text().then(function(t) { return Promise.reject(new Error('Scan: ' + r.status + (t ? ' ' + t.slice(0, 80) : ''))); });
+          }
+          return r.json();
+        })
+        .then(function(d) {
+          if (!d || !d.ok) {
+            statusEl.textContent = (d && d.error) || 'Scan failed';
+            return Promise.reject(new Error('Scan failed'));
+          }
+          var cams = d.cameras || [];
+          var idx = cams.length ? cams[0].index : 0;
+          statusEl.textContent = 'Found ' + cams.length + ' camera(s). Opening 1200p @ 50 fps...';
+          return fetch('/api/cameras/select', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ index: idx, width: CAMERA_1200P.width, height: CAMERA_1200P.height, fps: CAMERA_1200P.fps })
+          });
+        })
+        .then(function(r) {
+          if (!r.ok) {
+            return r.text().then(function(t) { return Promise.reject(new Error('Select: ' + r.status + (t ? ' ' + t.slice(0, 80) : ''))); });
+          }
+          return r.json();
+        })
+        .then(function(res) {
+          if (res && res.ok) {
+            statusEl.textContent = 'Camera set to 1200p @ 50 fps';
+            refreshCameraCurrent();
+            startCameraFeed();
+          } else {
+            statusEl.textContent = (res && res.error) || 'Select failed';
+          }
+        })
+        .catch(function(e) {
+          var msg = (e && e.message) ? e.message : String(e);
+          if (statusEl.textContent.indexOf('Scan failed') === -1 && statusEl.textContent.indexOf('Select failed') === -1) {
+            statusEl.textContent = msg.indexOf('Failed to fetch') !== -1 ? 'Server not reachable – is the backend running?' : ('Error: ' + msg);
+          }
+        });
+    };
+    document.getElementById('btnRefreshCam').onclick = startCameraFeed;
+    refreshCameraCurrent();
 
     function setConfigVisible(visible) {
       configPanel.style.display = visible ? 'block' : 'none';

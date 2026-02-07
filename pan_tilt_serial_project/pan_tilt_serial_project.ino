@@ -1534,6 +1534,7 @@ void loop() {
 
   if (feedbackEnabled && (now - lastFeedbackMs) >= feedbackIntervalMs) {
     sendServoFeedbackBinary(0);
+    sendImuBinary(0);   // gyro (gx,gy,gz) + roll/pitch/yaw continuously
     sendInaBinary(0);
     lastFeedbackMs = now;
   }
