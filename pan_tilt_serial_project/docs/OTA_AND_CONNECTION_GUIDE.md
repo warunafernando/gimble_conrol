@@ -219,6 +219,7 @@ While connected, the backend runs a **keepalive** every **30 seconds**:
 | `backend/app.py` | Flask + SocketIO server; auto-connect, keepalive, serial bridge. |
 | `backend/protocol.py` | Frame build/parse, CRC8, command/response constants. |
 | `docs/SERIAL_PROTOCOL.md` | Full serial protocol specification. |
+| `docs/GIMBAL_SERIAL_CONNECTION_REFERENCE.md` | Reference: how to connect to gimbal serial (probe, model_id, keep port open; bring-up in another project). |
 | `docs/UART_OTA_BUILD_GUIDE.md` | Detailed OTA build and load steps. |
 | `docs/UART_OTA_LOAD_GUIDE.md` | Short “how to load firmware” steps. |
 | `GIMBAL_PROTOCOL.md` | Protocol summary (commands/responses). |

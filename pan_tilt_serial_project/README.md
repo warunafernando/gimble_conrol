@@ -58,7 +58,7 @@ Binary frame format and command/response types. Full spec: [SERIAL_PROTOCOL.md](
 | **backend/** | Flask + SocketIO server: serial bridge, auto-connect, keepalive, web GUI. |
 | **backend/static/index.html** | Web GUI (connection, FW info, pan/tilt, IMU, OTA, debug). |
 | **tools/** | `start_gui.bat`, `uart_ota.py`, `ota_load.bat`, `get_fw_info.py`, upload scripts. |
-| **docs/** | [SERIAL_PROTOCOL.md](docs/SERIAL_PROTOCOL.md), [OTA_AND_CONNECTION_GUIDE.md](docs/OTA_AND_CONNECTION_GUIDE.md), UART OTA guides, IMU notes. |
+| **docs/** | [SERIAL_PROTOCOL.md](docs/SERIAL_PROTOCOL.md), [OTA_AND_CONNECTION_GUIDE.md](docs/OTA_AND_CONNECTION_GUIDE.md), [GIMBAL_SERIAL_CONNECTION_REFERENCE.md](docs/GIMBAL_SERIAL_CONNECTION_REFERENCE.md), UART OTA guides, IMU notes. |
 | **GIMBAL_PROTOCOL.md** | Protocol summary (commands and responses). |
 
 ---
@@ -67,6 +67,7 @@ Binary frame format and command/response types. Full spec: [SERIAL_PROTOCOL.md](
 
 - **[Serial protocol (full)](docs/SERIAL_PROTOCOL.md)** — Frame format, CRC8, all command/response types, FW_INFO, OTA.
 - **[OTA build and gimbal connection](docs/OTA_AND_CONNECTION_GUIDE.md)** — How to build firmware, load via UART OTA, and how the PC discovers and connects to the gimbal (auto-connect, keepalive, Rescan).
+- **[Gimbal serial connection reference](docs/GIMBAL_SERIAL_CONNECTION_REFERENCE.md)** — Implementation guide to bring up gimbal serial connection in another project (probe, model_id, keep port open, parallel probe, keepalive).
 
 ---
 
